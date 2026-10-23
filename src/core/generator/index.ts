@@ -1,0 +1,972 @@
+import { getComponent, HELPERS } from '../components';
+import { resolvedParams } from '../spec';
+import type { ComponentDef, ComponentInstance, ConditionDef, ConditionRef, Family, ParamDef, ParamValue, StrategySpec, VoterSpec } from '../types';
+import { Lines, pBool, pColor, pNum, pSource, pStr, slug, subst } from './pine';
+import { rangeLabel, tfLabel, tfMinutes } from '../timeframe';
+
+export interface GenerateResult {
+  code: string;
+  log: string[];
+  stats: { lines: number; inputs: number; plots: number; components: number; voters: number };
+}
+
+interface ResolvedCond {
+  ref: ConditionRef;
+  inst: ComponentInstance;
+  def: ConditionDef;
+  varL: string;
+  varS: string;
+}
+
+const CURRENCIES = new Set(['USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CAD', 'CHF', 'NZD', 'CNY', 'HKD', 'SGD', 'SEK', 'NOK', 'TRY', 'ZAR', 'INR', 'BRL', 'MXN', 'KRW', 'PLN', 'BTC', 'ETH', 'USDT']);
+const TIMEZONES = ['Exchange', 'UTC', 'America/New_York', 'America/Chicago', 'Europe/London', 'Europe/Berlin', 'Asia/Tokyo', 'Asia/Hong_Kong', 'Asia/Singapore', 'Australia/Sydney'];
+
+function inputLine(name: string, p: ParamDef, value: ParamValue, group: string): string {
+  const g = `group = ${group}`;
+  const tip = p.tooltip ? `, tooltip = ${pStr(p.tooltip)}` : '';
+  const title = pStr(p.label);
+  switch (p.type) {
+    case 'int': {
+      const mm = `${p.min !== undefined ? `, minval = ${pNum(p.min)}` : ''}${p.max !== undefined ? `, maxval = ${pNum(p.max)}` : ''}`;
+      return `${name} = input.int(${pNum(Number(value))}, ${title}${mm}${tip}, ${g})`;
+    }
+    case 'float': {
+      const mm = `${p.min !== undefined ? `, minval = ${pNum(p.min, true)}` : ''}${p.max !== undefined ? `, maxval = ${pNum(p.max, true)}` : ''}${p.step !== undefined ? `, step = ${pNum(p.step, true)}` : ''}`;
+      return `${name} = input.float(${pNum(Number(value), true)}, ${title}${mm}${tip}, ${g})`;
+    }
+    case 'bool':
+      return `${name} = input.bool(${pBool(Boolean(value))}, ${title}${tip}, ${g})`;
+    case 'source':
+      return `${name} = input.source(${pSource(String(value))}, ${title}${tip}, ${g})`;
+    case 'timeframe':
+      return `${name} = input.timeframe(${pStr(String(value))}, ${title}${tip}, ${g})`;
+    case 'session':
+      return `${name} = input.session(${pStr(String(value))}, ${title}${tip}, ${g})`;
+    case 'color':
+      return `${name} = input.color(${pColor(String(value))}, ${title}${tip}, ${g})`;
+    case 'string': {
+      const opts = p.options ? `, options = [${p.options.map(pStr).join(', ')}]` : '';
+      const v = p.options && !p.options.includes(String(value)) ? p.options[0] : String(value);
+      return `${name} = input.string(${pStr(v)}, ${title}${opts}${tip}, ${g})`;
+    }
+  }
+}
+
+function boolExpr(parts: string[], op: 'and' | 'or', empty: string): string {
+  if (!parts.length) return empty;
+  return parts.length === 1 ? parts[0] : parts.map((p) => `(${p})`).join(` ${op} `);
+}
+
+function sumExpr(parts: string[]): string {
+  return parts.length ? parts.join(' + ') : '0.0';
+}
+
+function maxExpr(parts: string[]): string {
+  return parts.length === 1 ? parts[0] : `math.max(${parts.join(', ')})`;
+}
+
+export function generatePine(spec: StrategySpec): GenerateResult {
+  const log: string[] = [];
+  const isStrat = spec.output === 'strategy';
+  const cons = spec.consensus.enabled && spec.strategies.length > 1;
+  if (!spec.strategies.length) throw new Error('Specification has no strategy (voter) defined');
+  if (spec.strategies.length > 1 && !spec.consensus.enabled) log.push('WARN: several strategies defined but consensus disabled — only the first strategy is generated.');
+  const voters = cons ? spec.strategies : spec.strategies.slice(0, 1);
+  const r = spec.risk;
+  const L = new Lines();
+  let inputCount = 0;
+  const countInputs = (lines: string[]) => (inputCount += lines.filter((l) => /= input\./.test(l)).length);
+
+  const instById = new Map(spec.components.map((c) => [c.id, c]));
+  const resolve = (ref: ConditionRef): ResolvedCond => {
+    const [instId, condId] = ref.ref.split('.');
+    const inst = instById.get(instId);
+    if (!inst) throw new Error(`Condition ${ref.ref} references unknown component instance "${instId}"`);
+    const def = getComponent(inst.type).conditions.find((c) => c.id === condId);
+    if (!def) throw new Error(`Component ${inst.type} has no condition "${condId}"`);
+    return { ref, inst, def, varL: `c_${instId}_${condId}_L`, varS: `c_${instId}_${condId}_S` };
+  };
+
+  const voterConds = voters.map((v) => v.conditions.filter((c) => c.enabled && !(cons && c.role === 'exit')).map(resolve));
+  const usedConds = new Map<string, ResolvedCond>();
+  voterConds.flat().forEach((c) => usedConds.set(c.ref.ref, c));
+
+  // ─── Header ───
+  const name = spec.meta.name.trim() || 'Generated Strategy';
+  const stratId = `${slug(name)}-v${spec.meta.version}`;
+  L.push('//@version=6');
+  L.push(`// ${name} v${spec.meta.version}`);
+  L.push(`// Generated by Pine Forge — Pine Script v6 ${isStrat ? 'strategy' : 'indicator'}${cons ? ' (multi-strategy consensus)' : ''}.`);
+  if (spec.market.symbol) L.push(`// Intended market: ${spec.market.symbol} (${spec.market.assetClass})`);
+  const tf = tfInfo(spec);
+  L.push(`// TIMEFRAME: set your chart to ${tf.recLabel}. Designed for ${tf.rangeLabel} charts; other timeframes trigger the`);
+  L.push('// "Chart timeframe guard" (warn or block entries). Parameters were chosen for this range.');
+  if (spec.market.timeframeNote) wrap(spec.market.timeframeNote, 96).forEach((l) => L.push(`// ${l}`));
+  if (spec.meta.description) wrap(spec.meta.description, 96).forEach((l) => L.push(`// ${l}`));
+  L.push('//');
+  L.push('// Signal states: SETUP (trigger seen, confluence not met) → SIGNAL (all rules met on a CLOSED bar)');
+  L.push(isStrat ? '//                → ORDER SUBMITTED (market order at signal close) → FILLED (Strategy Tester fill, next bar).' : '//                → SIMULATED ENTRY at the signal close (indicator mode never places orders).');
+  L.push('// Signals are evaluated on confirmed bars only. Higher-timeframe data uses the previous completed HTF bar.');
+  L.push('// Pivot-based structure is confirmed late by design (see input tooltips). No look-ahead is used.');
+  L.push('// DISCLAIMER: Educational tool. No guarantee of profit. Backtest results are hypothetical and');
+  L.push('// must be validated out-of-sample with realistic costs before any live use.');
+
+  // ─── Declaration ───
+  L.blank();
+  const short = pStr(shortTitle(name));
+  if (isStrat) {
+    const b = spec.backtest;
+    const cur = b.currency === 'NONE' || !CURRENCIES.has(b.currency) ? 'currency.NONE' : `currency.${b.currency}`;
+    const ct = b.commissionType === 'cash_per_contract' ? 'strategy.commission.cash_per_contract' : b.commissionType === 'cash_per_order' ? 'strategy.commission.cash_per_order' : 'strategy.commission.percent';
+    const margin = pNum(marginPct(spec), true);
+    L.push(
+      `strategy(${pStr(name)}, shorttitle = ${short}, overlay = true, initial_capital = ${pNum(b.initialCapital, true)}, currency = ${cur}, default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0, commission_type = ${ct}, commission_value = ${pNum(b.commissionValue, true)}, slippage = ${pNum(b.slippageTicks)}, process_orders_on_close = ${pBool(b.fillMode === 'on_close')}, calc_on_every_tick = false, use_bar_magnifier = ${pBool(b.barMagnifier)}, margin_long = ${margin}, margin_short = ${margin}, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)`,
+    );
+  } else {
+    L.push(`indicator(${pStr(name)}, shorttitle = ${short}, overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)`);
+  }
+
+  // ─── Inputs ───
+  L.section('INPUTS');
+  const ins: string[] = [
+    `STRAT_ID = ${pStr(stratId)}`,
+    'G_GEN = "① General"',
+    'G_RISK = "② Risk management"',
+    'G_TGT = "③ Targets & trade management"',
+    'G_FLT = "④ Filters"',
+    'G_VIS = "⑤ Visuals"',
+    'G_ALR = "⑥ Alerts"',
+    'G_SIG = "⑦ Signal rules"',
+    `i_dir = input.string(${pStr(spec.filters.direction === 'long' ? 'Long only' : spec.filters.direction === 'short' ? 'Short only' : 'Both')}, "Trade direction", options = ["Both", "Long only", "Short only"], group = G_GEN)`,
+    `i_tfGuard = input.string(${pStr(tf.guard)}, "Chart timeframe guard", options = ["Off", "Warn", "Block entries"], tooltip = ${pStr(`Designed for ${tf.rangeLabel} charts (recommended ${tf.recLabel}). Warn shows a banner on other timeframes; Block entries also stops new signals from trading.`)}, group = G_GEN)`,
+    `i_cooldown = input.int(${pNum(r.cooldownBars)}, "Cooldown after exit (bars)", minval = 0, group = G_GEN)`,
+    `i_closeOpp = input.bool(${pBool(r.closeOnOpposite)}, "Close position on opposite signal", group = G_GEN)`,
+    `i_timeExit = input.int(${pNum(r.timeExitBars)}, "Time exit after N bars (0 = off)", minval = 0, group = G_GEN)`,
+  ];
+  if (isStrat) ins.push(`i_anchorFill = input.bool(${pBool(spec.backtest.anchorToFill)}, "Re-anchor targets to actual fill price", tooltip = "Market orders fill at the next bar open. When on, targets are recomputed from the real fill while the stop stays at its structural/ATR level.", group = G_GEN)`);
+  ins.push(
+    `i_stopMode = input.string(${pStr(r.stopMode)}, "Stop-loss method", options = ["ATR", "Structure", "Percent", "Ticks"], group = G_RISK)`,
+    `i_atrLen = input.int(${pNum(r.atrLength)}, "ATR length", minval = 1, group = G_RISK)`,
+    `i_atrMult = input.float(${pNum(r.atrMult, true)}, "ATR stop multiplier", minval = 0.1, step = 0.1, group = G_RISK)`,
+    `i_stopPct = input.float(${pNum(r.stopPercent, true)}, "Percent stop (%)", minval = 0.01, step = 0.05, group = G_RISK)`,
+    `i_stopTicks = input.int(${pNum(r.stopTicks)}, "Tick stop (ticks)", minval = 1, group = G_RISK)`,
+    `i_swingLb = input.int(${pNum(r.swingLookback)}, "Structure fallback: swing lookback (bars)", minval = 2, group = G_RISK)`,
+    `i_structBuf = input.float(${pNum(r.structureBufferAtr, true)}, "Structure stop buffer (× ATR)", minval = 0, step = 0.05, group = G_RISK)`,
+    `i_maxStopAtr = input.float(${pNum(r.maxStopAtr, true)}, "Skip trade if stop wider than (× ATR, 0 = off)", minval = 0, step = 0.5, group = G_RISK)`,
+    `i_sizeMode = input.string(${pStr(r.sizing.mode)}, "Position sizing", options = ["Percent of equity risk", "Fixed cash risk", "Fixed quantity", "Percent of equity notional"], group = G_RISK)`,
+    `i_sizeVal = input.float(${pNum(r.sizing.value, true)}, "Sizing value (% / cash / qty)", minval = 0, step = 0.1, group = G_RISK)`,
+    `i_maxRiskPct = input.float(${pNum(r.sizing.maxRiskPct, true)}, "Max risk per trade (% equity, 0 = off)", minval = 0, step = 0.1, group = G_RISK)`,
+    `i_maxQty = input.float(${pNum(r.sizing.maxQty, true)}, "Max position size (units/contracts)", minval = 0, group = G_RISK)`,
+    `i_qtyStep = input.float(${pNum(r.sizing.qtyStep, true)}, "Quantity step (0 = auto: crypto 0.0001, else 1)", minval = 0, group = G_RISK)`,
+  );
+  if (isStrat) {
+    ins.push(
+      `i_useDLL = input.bool(${pBool(r.dailyLoss.enabled)}, "Daily loss limit", inline = "dll", group = G_RISK)`,
+      `i_dllPct = input.float(${pNum(r.dailyLoss.percent, true)}, "% of day-start equity", minval = 0.1, step = 0.1, inline = "dll", group = G_RISK)`,
+      `i_maxConsL = input.int(${pNum(r.maxConsecutiveLosses)}, "Pause after N consecutive losses (0 = off)", minval = 0, group = G_RISK)`,
+      'i_consReset = input.bool(true, "Reset loss streak each new day", group = G_RISK)',
+    );
+  } else {
+    ins.push(`i_equity = input.float(${pNum(spec.backtest.initialCapital, true)}, "Account equity for suggested size", minval = 0, group = G_RISK)`);
+  }
+  ins.push(
+    `i_tpCount = input.int(${pNum(r.tpCount)}, "Number of take-profit targets", minval = 1, maxval = 3, group = G_TGT)`,
+    `i_tp1R = input.float(${pNum(r.tpR[0], true)}, "TP1 (R multiple)", minval = 0.1, step = 0.1, inline = "tp1", group = G_TGT)`,
+    `i_tp1Pct = input.float(${pNum(r.tpQtyPct[0], true)}, "close %", minval = 1, maxval = 100, inline = "tp1", group = G_TGT)`,
+    `i_tp2R = input.float(${pNum(r.tpR[1], true)}, "TP2 (R multiple)", minval = 0.1, step = 0.1, inline = "tp2", group = G_TGT)`,
+    `i_tp2Pct = input.float(${pNum(r.tpQtyPct[1] || 1, true)}, "close %", minval = 1, maxval = 100, inline = "tp2", group = G_TGT)`,
+    `i_tp3R = input.float(${pNum(r.tpR[2], true)}, "TP3 (R multiple, closes the rest)", minval = 0.1, step = 0.1, group = G_TGT)`,
+    `i_minRR = input.float(${pNum(r.minRR, true)}, "Minimum planned reward:risk", minval = 0, step = 0.1, tooltip = "Weighted average R of the target plan. Entries are disabled if the plan is below this.", group = G_TGT)`,
+    `i_useBE = input.bool(${pBool(r.breakeven.enabled)}, "Move stop to breakeven", inline = "be", group = G_TGT)`,
+    `i_beR = input.float(${pNum(r.breakeven.triggerR, true)}, "after R", minval = 0.1, step = 0.1, inline = "be", group = G_TGT)`,
+    `i_beOff = input.int(${pNum(r.breakeven.offsetTicks)}, "offset ticks", minval = 0, inline = "be", group = G_TGT)`,
+    `i_useTrail = input.bool(${pBool(r.trailing.enabled)}, "ATR trailing stop", inline = "tr", group = G_TGT)`,
+    `i_trailAtr = input.float(${pNum(r.trailing.atrMult, true)}, "× ATR", minval = 0.1, step = 0.1, inline = "tr", group = G_TGT)`,
+    `i_trailActR = input.float(${pNum(r.trailing.activateR, true)}, "activate after R", minval = 0, step = 0.1, inline = "tr", group = G_TGT)`,
+  );
+  const tzOpts = `options = [${TIMEZONES.map(pStr).join(', ')}]`;
+  const tzVal = (t: string) => pStr(TIMEZONES.includes(t) ? t : 'Exchange');
+  ins.push(
+    `i_useSess = input.bool(${pBool(spec.filters.session.enabled)}, "Trade only in session", inline = "ses", group = G_FLT)`,
+    `i_sess = input.session(${pStr(spec.filters.session.session)}, "", inline = "ses", group = G_FLT)`,
+    `i_sessTz = input.string(${tzVal(spec.filters.session.timezone)}, "Session timezone", ${tzOpts}, group = G_FLT)`,
+    `i_useBlk = input.bool(${pBool(spec.filters.blackout.enabled)}, "News blackout window", inline = "blk", tooltip = "No new entries inside this daily window (e.g. around scheduled high-impact releases). Check the economic calendar.", group = G_FLT)`,
+    `i_blk = input.session(${pStr(spec.filters.blackout.session)}, "", inline = "blk", group = G_FLT)`,
+    `i_blkTz = input.string(${tzVal(spec.filters.blackout.timezone)}, "Blackout timezone", ${tzOpts}, group = G_FLT)`,
+    `i_useDate = input.bool(${pBool(spec.backtest.dateRange.enabled)}, "Limit date range", group = G_FLT)`,
+    `i_start = input.time(timestamp(${pStr(spec.backtest.dateRange.start + ' 00:00')}), "Start", group = G_FLT)`,
+    `i_end = input.time(timestamp(${pStr(spec.backtest.dateRange.end + ' 23:59')}), "End", group = G_FLT)`,
+  );
+  const v = spec.visuals;
+  ins.push(
+    `i_bullCol = input.color(${pColor(v.bullColor)}, "Bullish colour", inline = "col", group = G_VIS)`,
+    `i_bearCol = input.color(${pColor(v.bearColor)}, "Bearish colour", inline = "col", group = G_VIS)`,
+    `i_showLabels = input.bool(${pBool(v.showLabels)}, "Entry / exit labels", group = G_VIS)`,
+    `i_showSetups = input.bool(${pBool(v.showSetups)}, "Setups, invalidations & blocked signals", group = G_VIS)`,
+    `i_showLevels = input.bool(${pBool(v.showLevels)}, "Entry / stop / target levels", group = G_VIS)`,
+    `i_showComp = input.bool(${pBool(v.showComponentVisuals)}, "Indicator & structure visuals", group = G_VIS)`,
+    `i_showDash = input.bool(${pBool(v.showDashboard)}, "Dashboard", inline = "dash", group = G_VIS)`,
+    `i_dashPos = input.string(${pStr(v.dashboardPosition)}, "", options = ["Top right", "Top left", "Bottom right", "Bottom left"], inline = "dash", group = G_VIS)`,
+    `i_alSetup = input.bool(${pBool(spec.alerts.setup)}, "Alert: potential setups", group = G_ALR)`,
+    `i_alEntry = input.bool(${pBool(spec.alerts.entry)}, "Alert: confirmed entries", group = G_ALR)`,
+    `i_alExit = input.bool(${pBool(spec.alerts.exit)}, "Alert: targets, stops & exits", group = G_ALR)`,
+    `i_alInvalid = input.bool(${pBool(spec.alerts.invalidation)}, "Alert: invalidated setups", group = G_ALR)`,
+    `i_alJson = input.bool(${pBool(spec.alerts.json)}, "JSON alert messages (for webhooks)", group = G_ALR)`,
+  );
+  L.push(...ins);
+  countInputs(ins);
+
+  // Component inputs
+  for (const inst of spec.components) {
+    const def = getComponent(inst.type);
+    const params = resolvedParams(inst);
+    const group = `G_${inst.id}`;
+    const lines = [`${group} = ${pStr(`◆ ${def.name} [${inst.id}]`)}`, ...def.params.map((p) => inputLine(`i_${inst.id}_${p.key}`, p, params[p.key], group))];
+    L.push(...lines);
+    countInputs(lines);
+  }
+
+  // Signal-rule inputs
+  const sigInputs: string[] = [];
+  const toggles = new Map<string, string>(); // `${voterId}:${ref}` -> toggle expr
+  if (!cons) {
+    const vtr = voters[0];
+    const conf = vtr.confluence;
+    sigInputs.push(
+      `i_s1_mode = input.string(${pStr(capital(conf.mode))}, "Confluence mode", options = ["Strict", "Weighted", "Hybrid"], tooltip = "Strict: every rule must pass. Weighted: score of passing rules ≥ minimum. Hybrid: mandatory rules + score.", group = G_SIG)`,
+      `i_s1_min = input.float(${pNum(conf.minScore, true)}, "Minimum score (%)", minval = 0, maxval = 100, step = 5, group = G_SIG)`,
+      `i_s1_win = input.int(${pNum(conf.confirmWindowBars)}, "Confirmation window after trigger (bars)", minval = 0, tooltip = "0 = trigger and filters must agree on the same bar. N = filters may confirm up to N bars after the trigger; otherwise the setup is invalidated.", group = G_SIG)`,
+    );
+    voterConds[0].forEach((c, i) => {
+      const t = `u_s1_${i + 1}`;
+      const mand = c.ref.role === 'trigger' || c.ref.role === 'exit' ? '' : c.ref.mandatory ? ' (mandatory)' : ` (weight ${c.ref.weight})`;
+      sigInputs.push(`${t} = input.bool(true, ${pStr(`${roleTag(c.ref.role)} ${c.def.label}${mand}`)}, group = G_SIG)`);
+      toggles.set(`s1:${c.ref.ref}`, t);
+    });
+  } else {
+    const cs = spec.consensus;
+    sigInputs.push(
+      `G_CONS = "⑧ Consensus engine"`,
+      `i_tradeOn = input.string(${pStr(cs.tradeOn === 'strong' ? 'Strong only' : 'Standard and strong')}, "Enter on", options = ["Strong only", "Standard and strong"], group = G_CONS)`,
+      `i_consThr = input.float(${pNum(cs.threshold, true)}, "Standard agreement (%)", minval = 1, maxval = 100, step = 5, group = G_CONS)`,
+      `i_strongThr = input.float(${pNum(cs.strongThreshold, true)}, "STRONG agreement (%)", minval = 1, maxval = 100, step = 5, tooltip = "100 = every active strategy agrees.", group = G_CONS)`,
+      `i_voteWin = input.int(${pNum(cs.voteWindowBars)}, "Vote stays valid for (bars, 0 = until opposite signal)", minval = 0, group = G_CONS)`,
+      `i_perFamily = input.bool(${pBool(cs.perFamily)}, "Count agreement per strategy family", tooltip = "Correlated strategies (e.g. several trend systems) share one family vote so one idea is not counted many times.", group = G_CONS)`,
+      `i_veto = input.bool(${pBool(cs.vetoOnOpposite)}, "STRONG requires no opposing vote", group = G_CONS)`,
+    );
+    voters.forEach((vt) => sigInputs.push(`${vt.id}_on = input.bool(true, ${pStr(`Vote: ${vt.name} (${vt.family})`)}, group = G_CONS)`));
+  }
+  L.push(...sigInputs);
+  countInputs(sigInputs);
+
+  // ─── Helpers ───
+  L.section('HELPERS');
+  const helperNames = new Set<string>();
+  spec.components.forEach((c) => getComponent(c.type).helpers?.forEach((h) => helperNames.add(h)));
+  helperNames.forEach((h) => L.push(...HELPERS[h], ''));
+  L.push(
+    'f_tz(string tz) => tz == "Exchange" ? syminfo.timezone : tz',
+    'f_pos(string p) =>',
+    '    switch p',
+    '        "Top left" => position.top_left',
+    '        "Bottom right" => position.bottom_right',
+    '        "Bottom left" => position.bottom_left',
+    '        => position.top_right',
+    'f_num(float x) => na(x) ? "null" : str.tostring(x, format.mintick)',
+    'f_roundQty(float q) =>',
+    '    float step = i_qtyStep > 0 ? i_qtyStep : (syminfo.type == "crypto" ? 0.0001 : 1.0)',
+    '    na(q) or q <= 0 ? 0.0 : math.floor(q / step + 0.000000001) * step',
+  );
+
+  // ─── Components ───
+  L.section('INDICATOR ENGINE (only the components this strategy needs)');
+  const emitted = spec.components.map((inst) => ({ inst, def: getComponent(inst.type), code: getComponent(inst.type).emit({ mode: spec.output, visuals: true }) }));
+  for (const e of emitted) {
+    L.push(`// ── ${e.def.name} [${e.inst.id}] — ${e.def.doc.role}`);
+    L.push(...e.code.calc.map((l) => subst(l, e.inst.id)));
+    L.blank();
+  }
+
+  // ─── Conditions ───
+  L.section('CONDITIONS');
+  for (const c of usedConds.values()) {
+    L.push(`// ${c.def.label} (${c.def.family})`);
+    L.push(`${c.varL} = ${subst(c.def.long, c.inst.id)}`);
+    L.push(`${c.varS} = ${subst(c.def.short, c.inst.id)}`);
+  }
+
+  // ─── Voters ───
+  L.section(cons ? 'STRATEGY VOTERS (each strategy evaluated independently)' : 'SIGNAL ENGINE');
+  voters.forEach((vt, vi) => emitVoter(L, vt, voterConds[vi], cons, toggles));
+
+  // ─── Final signal selection ───
+  if (cons) emitConsensus(L, spec, voters);
+  else {
+    L.section('SIGNAL STATES');
+    L.push(
+      'longSignal = s1_sigL',
+      'shortSignal = s1_sigS',
+      'longSetup = s1_setupL',
+      'shortSetup = s1_setupS',
+      'longInvalid = s1_expL',
+      'shortInvalid = s1_expS',
+      'longPending = s1_pendL',
+      'shortPending = s1_pendS',
+      'scoreL = s1_scoreL',
+      'scoreS = s1_scoreS',
+      'tipL = s1_tipL',
+      'tipS = s1_tipS',
+      'strongL = false',
+      'strongS = false',
+    );
+  }
+
+  // Exit rules (single-strategy mode only)
+  const exitConds = cons ? [] : voterConds[0].filter((c) => c.ref.role === 'exit');
+  L.push(
+    `exitRuleL = ${boolExpr(exitConds.map((c) => `${toggles.get(`s1:${c.ref.ref}`)} and ${c.varL}`), 'or', 'false')}`,
+    `exitRuleS = ${boolExpr(exitConds.map((c) => `${toggles.get(`s1:${c.ref.ref}`)} and ${c.varS}`), 'or', 'false')}`,
+  );
+
+  // ─── Risk engine ───
+  emitRisk(L, spec, voters, voterConds);
+
+  // ─── Execution ───
+  if (isStrat) emitStrategyExecution(L);
+  else emitIndicatorSimulation(L);
+
+  // ─── Visuals ───
+  emitVisuals(L, spec, emitted, cons, voters);
+
+  emitTimeframeBanner(L, spec);
+
+  // ─── Alerts ───
+  emitAlerts(L, isStrat);
+
+  const code = L.toString();
+  const plots = (code.match(/^\s*(plot|plotshape|plotchar|bgcolor|fill)\(/gm) ?? []).length;
+  log.push(`Generated ${isStrat ? 'strategy' : 'indicator'} "${name}" with ${spec.components.length} component(s), ${voters.length} strategy voter(s), ${usedConds.size} condition(s).`);
+  if (cons) log.push(`Consensus: strong entry at ≥${spec.consensus.strongThreshold}% agreement${spec.consensus.perFamily ? ' (per family)' : ''}, vote window ${spec.consensus.voteWindowBars} bars.`);
+  return { code, log, stats: { lines: code.split('\n').length, inputs: inputCount, plots, components: spec.components.length, voters: voters.length } };
+}
+
+/** TradingView warns when shorttitle exceeds 10 characters. */
+export function shortTitle(name: string): string {
+  const clean = name.replace(/[^A-Za-z0-9 ]+/g, ' ').trim();
+  if (clean.length <= 10) return clean || 'Strategy';
+  const words = clean.split(/\s+/);
+  const head = words[0].slice(0, 7);
+  const tail = words.slice(1).map((w) => w[0].toUpperCase()).join('');
+  return `${head} ${tail}`.slice(0, 10).trim();
+}
+
+function capital(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function roleTag(role: string): string {
+  return role === 'trigger' ? '[Trigger]' : role === 'filter' ? '[Filter]' : role === 'confirmation' ? '[Confirm]' : '[Exit]';
+}
+
+export function marginPct(spec: StrategySpec): number {
+  const m: Record<string, number> = { forex: 3.33, futures: 10, indices: 5, commodities: 5, crypto: 100, stocks: 100, any: 100 };
+  return m[spec.market.assetClass] ?? 100;
+}
+
+function wrap(text: string, width: number): string[] {
+  const words = text.split(/\s+/);
+  const out: string[] = [];
+  let line = '';
+  for (const w of words) {
+    if ((line + ' ' + w).trim().length > width) {
+      out.push(line.trim());
+      line = w;
+    } else line += ' ' + w;
+  }
+  if (line.trim()) out.push(line.trim());
+  return out;
+}
+
+function emitVoter(L: Lines, vt: VoterSpec, conds: ResolvedCond[], cons: boolean, toggles: Map<string, string>) {
+  const p = vt.id;
+  const tg = (c: ResolvedCond) => (cons ? undefined : toggles.get(`${p}:${c.ref.ref}`));
+  const on = (c: ResolvedCond, side: 'L' | 'S') => {
+    const t = tg(c);
+    const v = side === 'L' ? c.varL : c.varS;
+    return t ? `${t} and ${v}` : v;
+  };
+  const triggers = conds.filter((c) => c.ref.role === 'trigger');
+  const rules = conds.filter((c) => c.ref.role === 'filter' || c.ref.role === 'confirmation');
+  const mand = rules.filter((c) => c.ref.mandatory);
+  const pass = (c: ResolvedCond, side: 'L' | 'S') => {
+    const t = tg(c);
+    const v = side === 'L' ? c.varL : c.varS;
+    return t ? `not ${t} or ${v}` : v;
+  };
+  // Weighted score with optional family de-duplication.
+  const groups = new Map<string, ResolvedCond[]>();
+  rules.forEach((c, i) => {
+    const key = vt.confluence.dedupeFamilies ? c.def.family : `${c.def.family}#${i}`;
+    groups.set(key, [...(groups.get(key) ?? []), c]);
+  });
+  const w = (c: ResolvedCond) => pNum(c.ref.weight, true);
+  const numer = (side: 'L' | 'S') => sumExpr([...groups.values()].map((g) => maxExpr(g.map((c) => `(${on(c, side)} ? ${w(c)} : 0.0)`))));
+  const denom = sumExpr([...groups.values()].map((g) => maxExpr(g.map((c) => (tg(c) ? `(${tg(c)} ? ${w(c)} : 0.0)` : w(c))))));
+  const mode = cons ? pStr(capital(vt.confluence.mode)) : 'i_s1_mode';
+  const min = cons ? pNum(vt.confluence.minScore, true) : 'i_s1_min';
+  const win = cons ? pNum(vt.confluence.confirmWindowBars) : 'i_s1_win';
+  const tipLines = (side: 'L' | 'S') =>
+    conds
+      .filter((c) => c.ref.role !== 'exit')
+      .map((c) => `(${side === 'L' ? c.varL : c.varS} ? "✓ " : "✗ ") + ${pStr(`${c.def.label}${c.ref.role === 'trigger' ? ' [trigger]' : c.ref.mandatory ? '' : ` [w${c.ref.weight}]`}`)}`)
+      .join(' + "\\n" + ');
+
+  L.push(`// ── Strategy ${p}: ${vt.name} — ${vt.confluence.mode} confluence`);
+  for (const side of ['L', 'S'] as const) {
+    L.push(
+      `${p}_trig${side} = ${boolExpr(triggers.map((c) => on(c, side)), 'or', 'false')}`,
+      `${p}_all${side} = ${boolExpr(rules.map((c) => pass(c, side)), 'and', 'true')}`,
+      `${p}_mand${side} = ${boolExpr(mand.map((c) => pass(c, side)), 'and', 'true')}`,
+    );
+  }
+  L.push(`${p}_den = ${denom}`);
+  L.push(`${p}_scoreL = ${p}_den > 0 ? 100 * (${numer('L')}) / ${p}_den : 100.0`);
+  L.push(`${p}_scoreS = ${p}_den > 0 ? 100 * (${numer('S')}) / ${p}_den : 100.0`);
+  for (const side of ['L', 'S'] as const) {
+    const opp = side === 'L' ? 'S' : 'L';
+    L.push(
+      `${p}_qual${side} = ${mode} == "Strict" ? ${p}_all${side} : ${mode} == "Hybrid" ? ${p}_mand${side} and ${p}_score${side} >= ${min} : ${p}_score${side} >= ${min}`,
+      `var int ${p}_arm${side} = -1`,
+      `if ${p}_trig${side}`,
+      `    ${p}_arm${side} := bar_index`,
+      `if ${p}_trig${opp} and not ${p}_trig${side}`,
+      `    ${p}_arm${side} := -1`,
+      `${p}_live${side} = ${p}_arm${side} >= 0 and bar_index - ${p}_arm${side} <= ${win}`,
+      `${p}_sig${side} = ${p}_live${side} and ${p}_qual${side} and barstate.isconfirmed`,
+      `${p}_pend${side} = ${p}_live${side} and ${p}_qual${side} and not barstate.isconfirmed`,
+      `${p}_setup${side} = ${p}_trig${side} and not ${p}_qual${side} and barstate.isconfirmed`,
+      `${p}_exp${side} = ${win} > 0 and ${p}_arm${side} >= 0 and bar_index - ${p}_arm${side} > ${win} and barstate.isconfirmed`,
+      `if ${p}_sig${side} or ${p}_exp${side}`,
+      `    ${p}_arm${side} := -1`,
+    );
+  }
+  L.push(`${p}_tipL = ${tipLines('L') || '""'}`);
+  L.push(`${p}_tipS = ${tipLines('S') || '""'}`);
+  L.blank();
+}
+
+function emitConsensus(L: Lines, spec: StrategySpec, voters: VoterSpec[]) {
+  L.section('CONSENSUS ENGINE — strategies vote; STRONG entry = first bar of full agreement');
+  for (const vt of voters) {
+    const p = vt.id;
+    L.push(
+      `${p}_bsL = ta.barssince(${p}_sigL)`,
+      `${p}_bsS = ta.barssince(${p}_sigS)`,
+      `${p}_lastL = not na(${p}_bsL) and (na(${p}_bsS) or ${p}_bsL < ${p}_bsS)`,
+      `${p}_lastS = not na(${p}_bsS) and (na(${p}_bsL) or ${p}_bsS < ${p}_bsL)`,
+      `${p}_voteL = ${p}_on and ${p}_lastL and (i_voteWin <= 0 or ${p}_bsL <= i_voteWin)`,
+      `${p}_voteS = ${p}_on and ${p}_lastS and (i_voteWin <= 0 or ${p}_bsS <= i_voteWin)`,
+    );
+  }
+  const fams = new Map<Family, VoterSpec[]>();
+  voters.forEach((v) => fams.set(v.family, [...(fams.get(v.family) ?? []), v]));
+  for (const [f, vs] of fams) {
+    L.push(
+      `fam_${f}_n = ${vs.map((v) => `(${v.id}_on ? 1 : 0)`).join(' + ')}`,
+      `fam_${f}_L = ${vs.map((v) => `(${v.id}_voteL ? 1 : 0)`).join(' + ')}`,
+      `fam_${f}_S = ${vs.map((v) => `(${v.id}_voteS ? 1 : 0)`).join(' + ')}`,
+    );
+  }
+  const famList = [...fams.keys()];
+  L.push(
+    `cons_nFam = ${famList.map((f) => `(fam_${f}_n > 0 ? 1 : 0)`).join(' + ')}`,
+    `cons_nAll = ${voters.map((v) => `(${v.id}_on ? 1 : 0)`).join(' + ')}`,
+    `cons_vL = ${voters.map((v) => `(${v.id}_voteL ? 1 : 0)`).join(' + ')}`,
+    `cons_vS = ${voters.map((v) => `(${v.id}_voteS ? 1 : 0)`).join(' + ')}`,
+    `cons_famL = ${famList.map((f) => `(fam_${f}_n > 0 ? fam_${f}_L / fam_${f}_n : 0.0)`).join(' + ')}`,
+    `cons_famS = ${famList.map((f) => `(fam_${f}_n > 0 ? fam_${f}_S / fam_${f}_n : 0.0)`).join(' + ')}`,
+    'consL = i_perFamily ? (cons_nFam > 0 ? 100 * cons_famL / cons_nFam : 0.0) : (cons_nAll > 0 ? 100 * cons_vL / cons_nAll : 0.0)',
+    'consS = i_perFamily ? (cons_nFam > 0 ? 100 * cons_famS / cons_nFam : 0.0) : (cons_nAll > 0 ? 100 * cons_vS / cons_nAll : 0.0)',
+    'strongL = consL >= i_strongThr and (not i_veto or consS == 0) and barstate.isconfirmed',
+    'strongS = consS >= i_strongThr and (not i_veto or consL == 0) and barstate.isconfirmed',
+    'stdL = consL >= i_consThr and consL > consS and barstate.isconfirmed',
+    'stdS = consS >= i_consThr and consS > consL and barstate.isconfirmed',
+    'strongLFirst = strongL and not strongL[1]',
+    'strongSFirst = strongS and not strongS[1]',
+    'stdLFirst = stdL and not stdL[1]',
+    'stdSFirst = stdS and not stdS[1]',
+    'longSignal = i_tradeOn == "Strong only" ? strongLFirst : (stdLFirst or strongLFirst)',
+    'shortSignal = i_tradeOn == "Strong only" ? strongSFirst : (stdSFirst or strongSFirst)',
+    '// Partial agreement = potential setup; it is invalidated if agreement fades before becoming STRONG.',
+    'var bool consPendL = false',
+    'var bool consPendS = false',
+    'longSetup = i_tradeOn == "Strong only" and stdLFirst and not strongL',
+    'shortSetup = i_tradeOn == "Strong only" and stdSFirst and not strongS',
+    'longInvalid = consPendL and not stdL and not strongL and barstate.isconfirmed',
+    'shortInvalid = consPendS and not stdS and not strongS and barstate.isconfirmed',
+    'if longSetup',
+    '    consPendL := true',
+    'if strongL or longInvalid',
+    '    consPendL := false',
+    'if shortSetup',
+    '    consPendS := true',
+    'if strongS or shortInvalid',
+    '    consPendS := false',
+    'longPending = false',
+    'shortPending = false',
+    'scoreL = consL',
+    'scoreS = consS',
+  );
+  const voteTip = (side: 'L' | 'S') =>
+    voters.map((v) => `(${v.id}_vote${side} ? "▲ " : ${v.id}_vote${side === 'L' ? 'S' : 'L'} ? "▼ " : "· ") + ${pStr(v.name)}`).join(' + "\\n" + ');
+  L.push(`tipL = "Agreement " + str.tostring(consL, "#") + "%\\n" + ${voteTip('L')}`);
+  L.push(`tipS = "Agreement " + str.tostring(consS, "#") + "%\\n" + ${voteTip('S')}`);
+}
+
+function emitRisk(L: Lines, spec: StrategySpec, voters: VoterSpec[], voterConds: ResolvedCond[][]) {
+  const isStrat = spec.output === 'strategy';
+  const tf = tfInfo(spec);
+  // Structural stop: the first trigger component (in voter order) that defines one.
+  let structL = 'na';
+  let structS = 'na';
+  outer: for (let i = 0; i < voters.length; i++) {
+    for (const c of voterConds[i].filter((x) => x.ref.role === 'trigger')) {
+      const def: ComponentDef = getComponent(c.inst.type);
+      if (def.structureStop) {
+        structL = subst(def.structureStop.long, c.inst.id);
+        structS = subst(def.structureStop.short, c.inst.id);
+        break outer;
+      }
+    }
+  }
+  L.section('RISK ENGINE — stop, targets, position size');
+  L.push(
+    'atrR = ta.atr(i_atrLen)',
+    'swLow = ta.lowest(low, i_swingLb)',
+    'swHigh = ta.highest(high, i_swingLb)',
+    `float structL = ${structL}`,
+    `float structS = ${structS}`,
+    'float stopL = switch i_stopMode',
+    '    "Structure" => (na(structL) ? swLow : structL) - i_structBuf * atrR',
+    '    "Percent" => close * (1 - i_stopPct / 100)',
+    '    "Ticks" => close - i_stopTicks * syminfo.mintick',
+    '    => close - i_atrMult * atrR',
+    'float stopS = switch i_stopMode',
+    '    "Structure" => (na(structS) ? swHigh : structS) + i_structBuf * atrR',
+    '    "Percent" => close * (1 + i_stopPct / 100)',
+    '    "Ticks" => close + i_stopTicks * syminfo.mintick',
+    '    => close + i_atrMult * atrR',
+    'riskL = close - stopL',
+    'riskS = stopS - close',
+    'stopOkL = not na(riskL) and riskL > 0 and (i_maxStopAtr <= 0 or riskL <= i_maxStopAtr * atrR)',
+    'stopOkS = not na(riskS) and riskS > 0 and (i_maxStopAtr <= 0 or riskS <= i_maxStopAtr * atrR)',
+    '// Planned (weighted) reward:risk of the target plan',
+    'p1 = i_tpCount == 1 ? 1.0 : i_tp1Pct / 100',
+    'p2 = i_tpCount == 3 ? math.min(i_tp2Pct / 100, 1 - p1) : 0.0',
+    'finalR = i_tpCount == 1 ? i_tp1R : i_tpCount == 2 ? i_tp2R : i_tp3R',
+    'plannedRR = i_tpCount == 1 ? i_tp1R : i_tpCount == 2 ? p1 * i_tp1R + (1 - p1) * i_tp2R : p1 * i_tp1R + p2 * i_tp2R + (1 - p1 - p2) * i_tp3R',
+    'rrOk = plannedRR >= i_minRR',
+  );
+  if (isStrat) {
+    const m = pNum(marginPct(spec), true);
+    L.push(
+      'eq = strategy.equity',
+      'f_unitValue(float priceDistance) => strategy.convert_to_account(priceDistance * syminfo.pointvalue)',
+      'f_qty(float risk) =>',
+      '    float riskUnit = f_unitValue(risk)',
+      '    float notionalUnit = f_unitValue(close)',
+      '    float raw = switch i_sizeMode',
+      '        "Fixed quantity" => i_sizeVal',
+      '        "Fixed cash risk" => riskUnit > 0 ? i_sizeVal / riskUnit : 0.0',
+      '        "Percent of equity notional" => notionalUnit > 0 ? eq * i_sizeVal / 100 / notionalUnit : 0.0',
+      '        => riskUnit > 0 ? eq * i_sizeVal / 100 / riskUnit : 0.0',
+      '    float capRisk = i_maxRiskPct > 0 and riskUnit > 0 ? eq * i_maxRiskPct / 100 / riskUnit : raw',
+      `    float capMargin = notionalUnit > 0 ? eq * 100 / ${m} / notionalUnit : raw`,
+      '    f_roundQty(math.min(raw, capRisk, capMargin, i_maxQty))',
+    );
+  } else {
+    L.push(
+      'eq = i_equity',
+      '// Indicator mode: suggested size assumes the account currency equals the symbol currency.',
+      'f_qty(float risk) =>',
+      '    float riskUnit = risk * syminfo.pointvalue',
+      '    float notionalUnit = close * syminfo.pointvalue',
+      '    float raw = switch i_sizeMode',
+      '        "Fixed quantity" => i_sizeVal',
+      '        "Fixed cash risk" => riskUnit > 0 ? i_sizeVal / riskUnit : 0.0',
+      '        "Percent of equity notional" => notionalUnit > 0 ? eq * i_sizeVal / 100 / notionalUnit : 0.0',
+      '        => riskUnit > 0 ? eq * i_sizeVal / 100 / riskUnit : 0.0',
+      '    float capRisk = i_maxRiskPct > 0 and riskUnit > 0 ? eq * i_maxRiskPct / 100 / riskUnit : raw',
+      '    f_roundQty(math.min(raw, capRisk, i_maxQty))',
+    );
+  }
+  L.push('qtyL = stopOkL ? f_qty(riskL) : 0.0', 'qtyS = stopOkS ? f_qty(riskS) : 0.0');
+
+  L.section('TRADE FILTERS & STATE');
+  L.push(
+    `tfOk = timeframe.in_seconds() >= timeframe.in_seconds(${pStr(tf.min)}) and timeframe.in_seconds() <= timeframe.in_seconds(${pStr(tf.max)})`,
+    'tfAllowed = i_tfGuard != "Block entries" or tfOk',
+    'inSession = not i_useSess or not na(time(timeframe.period, i_sess, f_tz(i_sessTz)))',
+    'inBlackout = i_useBlk and not na(time(timeframe.period, i_blk, f_tz(i_blkTz)))',
+    'inDate = not i_useDate or (time >= i_start and time <= i_end)',
+    'allowLong = i_dir != "Short only"',
+    'allowShort = i_dir != "Long only"',
+    'var int tDir = 0',
+    'var float tEntry = na',
+    'var float tSL = na',
+    'var float tTP1 = na',
+    'var float tTP2 = na',
+    'var float tTP3 = na',
+    'var float tRisk = na',
+    'var float tQty = na',
+    'var float tInitPos = na',
+    'var int tEntryBar = na',
+    'var bool tTp1Done = false',
+    'var bool tTp2Done = false',
+    'var bool tBeDone = false',
+    'var bool tTrailOn = false',
+    'var bool tStrong = false',
+    'var int lastExitBar = na',
+    'var int consLosses = 0',
+    'var float tNetAtEntry = 0.0',
+    'var int tClosedAtEntry = 0',
+    ...ALERT_HELPER,
+    'bool evLongSetup = false',
+    'bool evShortSetup = false',
+    'bool evLongEntry = false',
+    'bool evShortEntry = false',
+    'bool evTP1 = false',
+    'bool evTP2 = false',
+    'bool evExit = false',
+    'bool evFill = false',
+    'string exitReason = ""',
+    'slTag = tTrailOn ? "Trail" : tBeDone ? "BE" : "SL"',
+    'cooldownOk = na(lastExitBar) or bar_index - lastExitBar > i_cooldown',
+  );
+  if (isStrat) {
+    L.push(
+      'var float dayStartEq = strategy.initial_capital',
+      'newDay = timeframe.change("1D")',
+      'if newDay',
+      '    dayStartEq := strategy.equity',
+      '    if i_consReset',
+      '        consLosses := 0',
+      'dayLossHit = i_useDLL and dayStartEq - strategy.equity >= dayStartEq * i_dllPct / 100',
+      'haltCons = i_maxConsL > 0 and consLosses >= i_maxConsL',
+    );
+  } else {
+    L.push('dayLossHit = false', 'haltCons = false');
+  }
+  L.push(
+    'baseQty = na(tInitPos) ? tQty : tInitPos',
+    'q1 = f_roundQty(baseQty * i_tp1Pct / 100)',
+    'q2 = f_roundQty(baseQty * i_tp2Pct / 100)',
+    'tpFinal = i_tpCount == 1 ? tTP1 : i_tpCount == 2 ? tTP2 : tTP3',
+  );
+}
+
+function emitStrategyExecution(L: Lines) {
+  L.section('EXECUTION — Strategy Tester orders');
+  L.push(
+    'posSize = strategy.position_size',
+    'absPos = math.abs(posSize)',
+    '// (1) Fill detection: the market order submitted at the signal close fills on the next bar.',
+    'justFilled = tDir != 0 and posSize != 0 and posSize[1] == 0',
+    'if justFilled',
+    '    evFill := true',
+    '    tInitPos := absPos',
+    '    if i_anchorFill',
+    '        tEntry := strategy.position_avg_price',
+    '        tRisk := math.abs(tEntry - tSL)',
+    '        tTP1 := tEntry + tDir * i_tp1R * tRisk',
+    '        tTP2 := tEntry + tDir * i_tp2R * tRisk',
+    '        tTP3 := tEntry + tDir * i_tp3R * tRisk',
+    '// (2) Partial take-profit detection from the actual position size.',
+    'if tDir != 0 and absPos > 0 and not na(tInitPos)',
+    '    if i_tpCount >= 2 and not tTp1Done and q1 > 0 and absPos <= tInitPos - q1 * 0.999',
+    '        tTp1Done := true',
+    '        evTP1 := true',
+    '    if i_tpCount >= 3 and tTp1Done and not tTp2Done and q2 > 0 and absPos <= tInitPos - (q1 + q2) * 0.999',
+    '        tTp2Done := true',
+    '        evTP2 := true',
+    '// (3) Position closed (stop, target, rule exit) or order never filled.',
+    'if tDir != 0 and posSize == 0 and bar_index > tEntryBar',
+    '    filled = strategy.closedtrades > tClosedAtEntry',
+    '    exitReason := filled ? strategy.closedtrades.exit_comment(strategy.closedtrades - 1) : "Order not filled"',
+    '    pnl = strategy.netprofit - tNetAtEntry',
+    '    if filled',
+    '        consLosses := pnl < 0 ? consLosses + 1 : 0',
+    '    evExit := true',
+    '    if i_showLabels',
+    '        label.new(bar_index, tDir == 1 ? high : low, "EXIT\\n" + exitReason, style = tDir == 1 ? label.style_label_down : label.style_label_up, color = color.new(pnl >= 0 ? i_bullCol : i_bearCol, 35), textcolor = color.white, size = size.tiny, tooltip = "Exit reason: " + exitReason + "\\nTrade P&L (incl. partials): " + str.tostring(pnl, "#.##") + "\\nEntry: " + f_num(tEntry) + "  Stop: " + f_num(tSL))',
+    '    tDir := 0',
+    '    tInitPos := na',
+    '    lastExitBar := bar_index',
+    '// (4) Trade management at bar close (applies from the next bar).',
+    'if tDir != 0 and posSize != 0',
+    '    if i_useBE and not tBeDone and (tDir == 1 ? high >= tEntry + i_beR * tRisk : low <= tEntry - i_beR * tRisk)',
+    '        tSL := tDir == 1 ? math.max(tSL, tEntry + i_beOff * syminfo.mintick) : math.min(tSL, tEntry - i_beOff * syminfo.mintick)',
+    '        tBeDone := true',
+    '    if i_useTrail and (tTrailOn or (tDir == 1 ? high >= tEntry + i_trailActR * tRisk : low <= tEntry - i_trailActR * tRisk))',
+    '        tTrailOn := true',
+    '        tSL := tDir == 1 ? math.max(tSL, close - i_trailAtr * atrR) : math.min(tSL, close + i_trailAtr * atrR)',
+    '    if tDir == 1 and exitRuleL',
+    '        strategy.close("Long", comment = "Rule exit", alert_message = f_msg("EXIT_RULE", close))',
+    '    if tDir == -1 and exitRuleS',
+    '        strategy.close("Short", comment = "Rule exit", alert_message = f_msg("EXIT_RULE", close))',
+    '    if i_closeOpp and tDir == 1 and shortSignal',
+    '        strategy.close("Long", comment = "Opposite signal", alert_message = f_msg("EXIT_OPPOSITE", close))',
+    '    if i_closeOpp and tDir == -1 and longSignal',
+    '        strategy.close("Short", comment = "Opposite signal", alert_message = f_msg("EXIT_OPPOSITE", close))',
+    '    if i_timeExit > 0 and bar_index - tEntryBar >= i_timeExit',
+    '        strategy.close(tDir == 1 ? "Long" : "Short", comment = "Time exit", alert_message = f_msg("EXIT_TIME", close))',
+    '// (5) New entries — only when flat (one position at a time, no pyramiding).',
+    'flat = posSize == 0 and tDir == 0',
+    'canTrade = tfAllowed and inSession and not inBlackout and inDate and not dayLossHit and not haltCons and rrOk and cooldownOk',
+    'goLong = longSignal and allowLong and canTrade and flat and stopOkL and qtyL > 0',
+    'goShort = shortSignal and allowShort and canTrade and flat and stopOkS and qtyS > 0 and not goLong',
+    'if goLong or goShort',
+    '    tDir := goLong ? 1 : -1',
+    '    tEntry := close',
+    '    tSL := goLong ? stopL : stopS',
+    '    tRisk := math.abs(close - tSL)',
+    '    tTP1 := close + tDir * i_tp1R * tRisk',
+    '    tTP2 := close + tDir * i_tp2R * tRisk',
+    '    tTP3 := close + tDir * i_tp3R * tRisk',
+    '    tQty := goLong ? qtyL : qtyS',
+    '    tInitPos := na',
+    '    tEntryBar := bar_index',
+    '    tTp1Done := false',
+    '    tTp2Done := false',
+    '    tBeDone := false',
+    '    tTrailOn := false',
+    '    tStrong := goLong ? strongL : strongS',
+    '    tNetAtEntry := strategy.netprofit',
+    '    tClosedAtEntry := strategy.closedtrades',
+    '    evLongEntry := goLong',
+    '    evShortEntry := goShort',
+    '    strategy.entry(goLong ? "Long" : "Short", goLong ? strategy.long : strategy.short, qty = tQty, comment = goLong ? "BUY" : "SELL", alert_message = f_msg(goLong ? "ENTRY_LONG_FILLED" : "ENTRY_SHORT_FILLED", close))',
+    '// (6) Bracket orders — stop and targets mirror the plotted levels exactly.',
+    'slTag2 = tTrailOn ? "Trail" : tBeDone ? "BE" : "SL"',
+    'tpFinalNow = i_tpCount == 1 ? tTP1 : i_tpCount == 2 ? tTP2 : tTP3',
+    'baseQtyNow = na(tInitPos) ? tQty : tInitPos',
+    'q1Now = f_roundQty(baseQtyNow * i_tp1Pct / 100)',
+    'q2Now = f_roundQty(baseQtyNow * i_tp2Pct / 100)',
+    'if tDir != 0',
+    '    entryId = tDir == 1 ? "Long" : "Short"',
+    '    pre = tDir == 1 ? "L-" : "S-"',
+    '    if i_tpCount >= 2 and not tTp1Done and q1Now > 0',
+    '        strategy.exit(pre + "TP1", entryId, qty = q1Now, limit = tTP1, stop = tSL, comment_profit = "TP1", comment_loss = slTag2, alert_message = f_msg("EXIT_ORDER_FILLED", na))',
+    '    if i_tpCount >= 3 and not tTp2Done and q2Now > 0',
+    '        strategy.exit(pre + "TP2", entryId, qty = q2Now, limit = tTP2, stop = tSL, comment_profit = "TP2", comment_loss = slTag2, alert_message = f_msg("EXIT_ORDER_FILLED", na))',
+    '    strategy.exit(pre + "TPF", entryId, limit = tpFinalNow, stop = tSL, comment_profit = "TP" + str.tostring(i_tpCount), comment_loss = slTag2, alert_message = f_msg("EXIT_ORDER_FILLED", na))',
+  );
+}
+
+function emitIndicatorSimulation(L: Lines) {
+  L.section('SIGNAL SIMULATION — indicator mode (no orders; levels tracked from the signal close)');
+  L.push(
+    'justFilled = false',
+    'bool vExit = false',
+    'float vExitPx = na',
+    'if tDir != 0 and bar_index > tEntryBar',
+    '    hitSL = tDir == 1 ? low <= tSL : high >= tSL',
+    '    if hitSL',
+    '        vExit := true',
+    '        exitReason := slTag',
+    '        vExitPx := tSL',
+    '    else',
+    '        if i_tpCount >= 2 and not tTp1Done and (tDir == 1 ? high >= tTP1 : low <= tTP1)',
+    '            tTp1Done := true',
+    '            evTP1 := true',
+    '        if i_tpCount >= 3 and tTp1Done and not tTp2Done and (tDir == 1 ? high >= tTP2 : low <= tTP2)',
+    '            tTp2Done := true',
+    '            evTP2 := true',
+    '        if tDir == 1 ? high >= tpFinal : low <= tpFinal',
+    '            vExit := true',
+    '            exitReason := "TP" + str.tostring(i_tpCount)',
+    '            vExitPx := tpFinal',
+    '    if not vExit',
+    '        if i_useBE and not tBeDone and (tDir == 1 ? high >= tEntry + i_beR * tRisk : low <= tEntry - i_beR * tRisk)',
+    '            tSL := tDir == 1 ? math.max(tSL, tEntry + i_beOff * syminfo.mintick) : math.min(tSL, tEntry - i_beOff * syminfo.mintick)',
+    '            tBeDone := true',
+    '        if i_useTrail and (tTrailOn or (tDir == 1 ? high >= tEntry + i_trailActR * tRisk : low <= tEntry - i_trailActR * tRisk))',
+    '            tTrailOn := true',
+    '            tSL := tDir == 1 ? math.max(tSL, close - i_trailAtr * atrR) : math.min(tSL, close + i_trailAtr * atrR)',
+    '        ruleHit = tDir == 1 ? exitRuleL : exitRuleS',
+    '        oppHit = i_closeOpp and (tDir == 1 ? shortSignal : longSignal)',
+    '        timeHit = i_timeExit > 0 and bar_index - tEntryBar >= i_timeExit',
+    '        if ruleHit or oppHit or timeHit',
+    '            vExit := true',
+    '            exitReason := ruleHit ? "Rule exit" : oppHit ? "Opposite signal" : "Time exit"',
+    '            vExitPx := close',
+    'if vExit and barstate.isconfirmed',
+    '    evExit := true',
+    '    rMult = tDir * (vExitPx - tEntry) / tRisk',
+    '    if i_showLabels',
+    '        label.new(bar_index, tDir == 1 ? high : low, "EXIT\\n" + exitReason, style = tDir == 1 ? label.style_label_down : label.style_label_up, color = color.new(rMult >= 0 ? i_bullCol : i_bearCol, 35), textcolor = color.white, size = size.tiny, tooltip = "Simulated exit (" + exitReason + ") @ " + f_num(vExitPx) + "\\nResult on remaining size: " + str.tostring(rMult, "#.##") + " R (no costs)")',
+    '    tDir := 0',
+    '    lastExitBar := bar_index',
+    'flat = tDir == 0',
+    'canTrade = tfAllowed and inSession and not inBlackout and inDate and rrOk and cooldownOk',
+    'goLong = longSignal and allowLong and canTrade and flat and stopOkL',
+    'goShort = shortSignal and allowShort and canTrade and flat and stopOkS and not goLong',
+    'if goLong or goShort',
+    '    tDir := goLong ? 1 : -1',
+    '    tEntry := close',
+    '    tSL := goLong ? stopL : stopS',
+    '    tRisk := math.abs(close - tSL)',
+    '    tTP1 := close + tDir * i_tp1R * tRisk',
+    '    tTP2 := close + tDir * i_tp2R * tRisk',
+    '    tTP3 := close + tDir * i_tp3R * tRisk',
+    '    tQty := goLong ? qtyL : qtyS',
+    '    tEntryBar := bar_index',
+    '    tTp1Done := false',
+    '    tTp2Done := false',
+    '    tBeDone := false',
+    '    tTrailOn := false',
+    '    tStrong := goLong ? strongL : strongS',
+    '    evLongEntry := goLong',
+    '    evShortEntry := goShort',
+  );
+}
+
+function emitVisuals(L: Lines, spec: StrategySpec, emitted: { inst: ComponentInstance; def: ComponentDef; code: ReturnType<ComponentDef['emit']> }[], cons: boolean, voters: VoterSpec[]) {
+  const isStrat = spec.output === 'strategy';
+  const tf = tfInfo(spec);
+  L.section('VISUALS — component overlays');
+  for (const e of emitted) {
+    const plots = [...(e.code.plots ?? []), ...(e.code.visuals ?? [])];
+    if (plots.length) L.push(`// ${e.def.name}`, ...plots.map((l) => subst(l, e.inst.id)));
+  }
+  L.section('VISUALS — signals, levels, dashboard');
+  const sigWord = cons ? ['STRONG BUY', 'STRONG SELL'] : ['BUY', 'SELL'];
+  L.push(
+    'evLongSetup := longSetup',
+    'evShortSetup := shortSetup',
+    `f_entryTip(int dir, string tip, float score) => (dir == 1 ? "LONG" : "SHORT") + " signal · " + timeframe.period + " · " + str.format_time(time_close, "yyyy-MM-dd HH:mm", syminfo.timezone) + "\\nPrice " + f_num(close) + " | Stop " + f_num(tSL) + " | TP1 " + f_num(tTP1) + (i_tpCount >= 2 ? " | TP2 " + f_num(tTP2) : "") + (i_tpCount >= 3 ? " | TP3 " + f_num(tTP3) : "") + "\\nPlanned R:R " + str.tostring(plannedRR, "#.##") + " · Score " + str.tostring(score, "#") + "%" + ${isStrat ? '"\\nMarket order submitted at bar close → fills next bar"' : '"\\nSize (suggested) " + str.tostring(tQty)'} + "\\n\\n" + tip`,
+    'if i_showLabels and evLongEntry',
+    `    label.new(bar_index, low, ${cons ? `(tStrong ? ${pStr(sigWord[0])} : "BUY")` : '"BUY"'} + "\\n" + f_num(close), style = label.style_label_up, color = i_bullCol, textcolor = color.white, size = tStrong ? size.normal : size.small, tooltip = f_entryTip(1, tipL, scoreL))`,
+    'if i_showLabels and evShortEntry',
+    `    label.new(bar_index, high, ${cons ? `(tStrong ? ${pStr(sigWord[1])} : "SELL")` : '"SELL"'} + "\\n" + f_num(close), style = label.style_label_down, color = i_bearCol, textcolor = color.white, size = tStrong ? size.normal : size.small, tooltip = f_entryTip(-1, tipS, scoreS))`,
+    'f_block(bool allow, bool stopOk) => not allow ? "direction filter" : not stopOk ? "invalid / too-wide stop" : not tfAllowed ? "chart timeframe outside designed range (use ${tf.recLabel})" : not inSession ? "outside session" : inBlackout ? "news blackout" : not inDate ? "outside date range" : dayLossHit ? "daily loss limit" : haltCons ? "loss-streak pause" : not rrOk ? "target plan below min R:R" : not cooldownOk ? "cooldown" : tDir != 0 ? "position already open" : "sizing returned 0"',
+    'if i_showSetups and longSignal and not evLongEntry',
+    `    label.new(bar_index, low, "⊘", style = label.style_label_up, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny, tooltip = ${pStr(cons ? 'Consensus long' : 'Long signal')} + " not traded: " + f_block(allowLong, stopOkL) + "\\n" + tipL)`,
+    'if i_showSetups and shortSignal and not evShortEntry',
+    `    label.new(bar_index, high, "⊘", style = label.style_label_down, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny, tooltip = ${pStr(cons ? 'Consensus short' : 'Short signal')} + " not traded: " + f_block(allowShort, stopOkS) + "\\n" + tipS)`,
+  );
+  if (cons) {
+    L.push(
+      '// Strong agreement is always marked at its FIRST bar, even when no trade is taken.',
+      'plotshape(strongLFirst and not evLongEntry, "Strong long agreement", shape.labelup, location.belowbar, color.new(i_bullCol, 40), text = "ALL▲", textcolor = color.white, size = size.tiny)',
+      'plotshape(strongSFirst and not evShortEntry, "Strong short agreement", shape.labeldown, location.abovebar, color.new(i_bearCol, 40), text = "ALL▼", textcolor = color.white, size = size.tiny)',
+    );
+  }
+  L.push(
+    'plotshape(i_showSetups and longSetup, "Long setup", shape.triangleup, location.belowbar, color.new(i_bullCol, 55), size = size.tiny)',
+    'plotshape(i_showSetups and shortSetup, "Short setup", shape.triangledown, location.abovebar, color.new(i_bearCol, 55), size = size.tiny)',
+    'plotshape(i_showSetups and longInvalid, "Long setup invalidated", shape.xcross, location.belowbar, color.new(color.gray, 30), size = size.tiny)',
+    'plotshape(i_showSetups and shortInvalid, "Short setup invalidated", shape.xcross, location.abovebar, color.new(color.gray, 30), size = size.tiny)',
+    'plotshape(i_showSetups and longPending, "Long forming (bar not closed)", shape.circle, location.belowbar, color.new(i_bullCol, 70), size = size.tiny)',
+    'plotshape(i_showSetups and shortPending, "Short forming (bar not closed)", shape.circle, location.abovebar, color.new(i_bearCol, 70), size = size.tiny)',
+    `plotshape(${isStrat ? 'justFilled and tDir == 1' : 'false'}, "Long filled", shape.diamond, location.belowbar, i_bullCol, size = size.tiny)`,
+    `plotshape(${isStrat ? 'justFilled and tDir == -1' : 'false'}, "Short filled", shape.diamond, location.abovebar, i_bearCol, size = size.tiny)`,
+    'plotshape(i_showLabels and evTP1, "TP1 hit", shape.flag, location.abovebar, color.new(i_bullCol, 20), text = "TP1", textcolor = color.new(i_bullCol, 20), size = size.tiny)',
+    'plotshape(i_showLabels and evTP2, "TP2 hit", shape.flag, location.abovebar, color.new(i_bullCol, 20), text = "TP2", textcolor = color.new(i_bullCol, 20), size = size.tiny)',
+    'inTrade = tDir != 0',
+    'plot(i_showLevels and inTrade ? tEntry : na, "Entry level", color = color.new(color.gray, 20), style = plot.style_linebr)',
+    'plot(i_showLevels and inTrade ? tSL : na, "Stop level", color = i_bearCol, style = plot.style_linebr, linewidth = 2)',
+    'plot(i_showLevels and inTrade and i_tpCount >= 2 and not tTp1Done ? tTP1 : na, "TP1 level", color = color.new(i_bullCol, 40), style = plot.style_linebr)',
+    'plot(i_showLevels and inTrade and i_tpCount >= 3 and not tTp2Done ? tTP2 : na, "TP2 level", color = color.new(i_bullCol, 20), style = plot.style_linebr)',
+    'plot(i_showLevels and inTrade ? (i_tpCount == 1 ? tTP1 : i_tpCount == 2 ? tTP2 : tTP3) : na, "Final target", color = i_bullCol, style = plot.style_linebr, linewidth = 2)',
+  );
+
+  // Dashboard
+  const compRows = emitted.flatMap((e) => (e.code.dashboard ?? []).map((d) => ({ label: d.label, value: subst(d.value, e.inst.id) })));
+  const rows: [string, string][] = [
+    ['"Mode"', isStrat ? '"Strategy · orders"' : '"Indicator · signals only"'],
+    ['"Timeframe"', `timeframe.period + (tfOk ? ${pStr(` ✓ (designed ${tf.rangeLabel})`)} : ${pStr(` ⚠ designed ${tf.rangeLabel} — use ${tf.recLabel}`)})`],
+    ['"Position"', 'tDir == 1 ? "LONG" : tDir == -1 ? "SHORT" : "FLAT"'],
+    ['"Entry / Stop"', 'inTrade ? f_num(tEntry) + " / " + f_num(tSL) + " (" + (tTrailOn ? "Trail" : tBeDone ? "BE" : "SL") + ")" : "—"'],
+    ['"Targets"', 'inTrade ? f_num(tTP1) + (i_tpCount >= 2 ? " · " + f_num(tTP2) : "") + (i_tpCount >= 3 ? " · " + f_num(tTP3) : "") : "—"'],
+    ['"Planned R:R"', 'str.tostring(plannedRR, "#.##") + (rrOk ? "" : " < min!")'],
+    ['"Long / short score"', 'str.tostring(scoreL, "#") + "% / " + str.tostring(scoreS, "#") + "%"'],
+    ['"Filters"', '(inSession ? "session ✓" : "session ✗") + (inBlackout ? " · blackout" : "") + (dayLossHit ? " · DLL hit" : "") + (haltCons ? " · streak pause" : "")'],
+  ];
+  if (cons) voters.forEach((v) => rows.push([pStr(v.name.length > 26 ? v.name.slice(0, 25) + '…' : v.name), `not ${v.id}_on ? "off" : ${v.id}_voteL ? "▲ long (" + str.tostring(${v.id}_bsL) + " bars)" : ${v.id}_voteS ? "▼ short (" + str.tostring(${v.id}_bsS) + " bars)" : "· neutral"`]));
+  compRows.forEach((d) => rows.push([pStr(d.label), d.value]));
+  L.push(`var table dash = table.new(f_pos(i_dashPos), 2, ${rows.length + 1}, bgcolor = color.new(#131722, 8), border_color = color.new(#2A2E39, 0), border_width = 1, frame_color = color.new(#2A2E39, 0), frame_width = 1)`);
+  L.push('if barstate.islast and i_showDash');
+  L.push(`    table.cell(dash, 0, 0, STRAT_ID, text_color = color.white, text_size = size.small, bgcolor = color.new(#1E222D, 0))`);
+  L.push(`    table.cell(dash, 1, 0, ${cons ? '"Agreement ▲" + str.tostring(consL, "#") + "% ▼" + str.tostring(consS, "#") + "%"' : '"Signals on bar close"'}, text_color = color.new(color.white, 20), text_size = size.small, bgcolor = color.new(#1E222D, 0))`);
+  rows.forEach(([label, value], i) => {
+    L.push(`    table.cell(dash, 0, ${i + 1}, ${label}, text_color = color.new(color.white, 35), text_size = size.small, text_halign = text.align_left)`);
+    L.push(`    table.cell(dash, 1, ${i + 1}, ${value}, text_color = color.white, text_size = size.small, text_halign = text.align_left)`);
+  });
+}
+
+function emitTimeframeBanner(L: Lines, spec: StrategySpec) {
+  const tf = tfInfo(spec);
+  L.push(
+    'var table tfWarn = table.new(position.bottom_center, 1, 1, bgcolor = color.new(#D03B3B, 10), frame_color = color.new(#D03B3B, 0), frame_width = 1)',
+    'if barstate.islast and i_tfGuard != "Off" and not tfOk',
+    `    table.cell(tfWarn, 0, 0, "⚠ Chart timeframe " + timeframe.period + ${pStr(` is outside this script's designed range (${tf.rangeLabel}). Switch the chart to ${tf.recLabel}`)} + (i_tfGuard == "Block entries" ? " — new entries are blocked." : "."), text_color = color.white, text_size = size.normal)`,
+  );
+}
+
+export interface TimeframeInfo {
+  rec: string;
+  min: string;
+  max: string;
+  recLabel: string;
+  rangeLabel: string;
+  guard: 'Off' | 'Warn' | 'Block entries';
+}
+
+/** Recommended chart timeframe and designed range, normalised for Pine (timeframe.in_seconds strings). */
+export function tfInfo(spec: StrategySpec): TimeframeInfo {
+  const norm = (t: string) => (tfMinutes(t) === null ? '60' : t.toUpperCase());
+  const rec = norm(spec.market.timeframe || '60');
+  let [min, max] = spec.market.timeframeRange ? spec.market.timeframeRange.map(norm) : [rec, rec];
+  // The chosen timeframe always counts as valid, even if the user picked one outside the template range.
+  if (tfMinutes(rec)! < tfMinutes(min)!) min = rec;
+  if (tfMinutes(rec)! > tfMinutes(max)!) max = rec;
+  const g = spec.market.timeframeGuard ?? 'warn';
+  return { rec, min, max, recLabel: tfLabel(rec), rangeLabel: rangeLabel([min, max]), guard: g === 'off' ? 'Off' : g === 'block' ? 'Block entries' : 'Warn' };
+}
+
+function emitAlerts(L: Lines, isStrat: boolean) {
+  L.section('ALERTS');
+  L.push(
+    'if i_alSetup and (evLongSetup or evShortSetup)',
+    '    alert(f_msg(evLongSetup ? "SETUP_LONG" : "SETUP_SHORT", close), alert.freq_once_per_bar_close)',
+    'if i_alEntry and (evLongEntry or evShortEntry)',
+    `    alert(f_msg(evLongEntry ? "${isStrat ? 'ENTRY_LONG_ORDER' : 'ENTRY_LONG'}" : "${isStrat ? 'ENTRY_SHORT_ORDER' : 'ENTRY_SHORT'}", close), alert.freq_once_per_bar_close)`,
+    'if i_alExit and evTP1',
+    '    alert(f_msg("TP1_HIT", tTP1), alert.freq_once_per_bar_close)',
+    'if i_alExit and evTP2',
+    '    alert(f_msg("TP2_HIT", tTP2), alert.freq_once_per_bar_close)',
+    'if i_alExit and evExit',
+    '    alert(f_msg("POSITION_CLOSED:" + exitReason, close), alert.freq_once_per_bar_close)',
+    'if i_alInvalid and (longInvalid or shortInvalid)',
+    '    alert(f_msg(longInvalid ? "SETUP_LONG_INVALIDATED" : "SETUP_SHORT_INVALIDATED", close), alert.freq_once_per_bar_close)',
+  );
+  if (!isStrat) {
+    L.push(
+      '// alertcondition() only works in indicators; strategies use alert() above and order-fill alerts.',
+      'alertcondition(evLongSetup, "Potential long setup", "{{ticker}} {{interval}}: potential LONG setup @ {{close}}")',
+      'alertcondition(evShortSetup, "Potential short setup", "{{ticker}} {{interval}}: potential SHORT setup @ {{close}}")',
+      'alertcondition(evLongEntry, "Confirmed long entry", "{{ticker}} {{interval}}: confirmed LONG entry @ {{close}}")',
+      'alertcondition(evShortEntry, "Confirmed short entry", "{{ticker}} {{interval}}: confirmed SHORT entry @ {{close}}")',
+      'alertcondition(evTP1 or evTP2, "Take-profit reached", "{{ticker}} {{interval}}: take-profit reached")',
+      'alertcondition(evExit, "Position closed", "{{ticker}} {{interval}}: simulated position closed @ {{close}}")',
+      'alertcondition(longInvalid or shortInvalid, "Setup invalidated", "{{ticker}} {{interval}}: setup invalidated")',
+    );
+  }
+}
+
+/** Alert/order message builder — emitted right after the trade-state variables it reads. */
+export const ALERT_HELPER = [
+  'f_msg(string evt, float px) =>',
+  '    i_alJson ? \'{"id":"\' + STRAT_ID + \'","event":"\' + evt + \'","symbol":"\' + syminfo.tickerid + \'","tf":"\' + timeframe.period + \'","price":\' + f_num(px) + \',"sl":\' + f_num(tSL) + \',"tp1":\' + f_num(tTP1) + \',"tp2":\' + f_num(tTP2) + \',"tp3":\' + f_num(tTP3) + \',"qty":\' + (na(tQty) ? "null" : str.tostring(tQty)) + \',"time":"\' + str.format_time(time_close, "yyyy-MM-dd\'T\'HH:mm:ss\'Z\'", "UTC") + \'"}\' : STRAT_ID + " " + evt + " " + syminfo.tickerid + " " + timeframe.period + " @ " + f_num(px)',
+];
