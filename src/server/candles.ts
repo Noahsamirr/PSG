@@ -34,6 +34,8 @@ export interface CandleResponse {
   label: string;
   qtyStep: number;
   isProxy: boolean;
+  instrument: string;
+  fetchedAt: string;
 }
 
 const CRYPTO = /^(BTC|ETH|SOL|XRP|ADA|DOGE|BNB|LTC|AVAX|DOT|LINK|MATIC|POL|TRX|TON|SHIB|PEPE|ARB|OP|SUI|NEAR|ATOM|APT|INJ|FIL|UNI|AAVE|ETC|BCH|XLM)/;
@@ -76,6 +78,10 @@ export function resolveSource(symbolIn: string, assetClass?: string): SourceCand
       cand('binance', 'PAXGUSDT', 'PAX Gold token (gold-backed)', true),
       cand('twelvedata', 'XAU/USD', 'spot gold (API key)'),
     ];
+  }
+  if (/^(PAXG|XAUT)(USDT)?$/.test(symbol)) {
+    const tok = symbol.replace(/USDT$/, '') + 'USDT';
+    return [cand('binance', tok, tok.startsWith('PAXG') ? 'PAX Gold token (gold-backed)' : 'Tether Gold token (gold-backed)'), cand('binancef', 'XAUUSDT', 'gold perpetual in USDT (tracks spot gold)', true)];
   }
   if (symbol === 'XAGUSDT') return [cand('binancef', 'XAGUSDT', 'silver perpetual priced in USDT'), cand('yahoo', 'SI=F', 'COMEX silver futures', true)];
   if (SILVER.includes(symbol)) return [cand('yahoo', 'SI=F', 'COMEX silver futures (close to spot)', true), cand('binancef', 'XAGUSDT', 'silver perpetual in USDT', true), cand('twelvedata', 'XAG/USD', 'spot silver (API key)')];
@@ -224,6 +230,20 @@ async function twelvedata(ticker: string, tf: string, limit: number): Promise<Ba
 
 const cache = new Map<string, { at: number; res: CandleResponse }>();
 
+/** Per-provider request outcomes since the server started (shown on the admin dashboard). */
+export const providerStats: Record<string, { ok: number; fail: number; lastError: string | null; lastErrorAt: string | null; lastOkAt: string | null }> = {};
+function track(source: string, ok: boolean, err?: string) {
+  const p = (providerStats[source] ??= { ok: 0, fail: 0, lastError: null, lastErrorAt: null, lastOkAt: null });
+  if (ok) {
+    p.ok++;
+    p.lastOkAt = new Date().toISOString();
+  } else {
+    p.fail++;
+    p.lastError = err ?? 'error';
+    p.lastErrorAt = new Date().toISOString();
+  }
+}
+
 export async function getCandles(req: CandleRequest): Promise<CandleResponse> {
   const limit = Math.min(Math.max(Number(req.limit) || 1000, 100), 3000);
   const tf = (req.tf || '60').toUpperCase().replace(/^D$/, '1D').replace(/^W$/, '1W');
@@ -243,12 +263,100 @@ export async function getCandles(req: CandleRequest): Promise<CandleResponse> {
     try {
       const bars = c.source === 'binance' ? await binance(c.ticker, tf, limit) : c.source === 'binancef' ? await binanceFutures(c.ticker, tf, limit) : c.source === 'yahoo' ? await yahoo(c.ticker, tf, limit) : await twelvedata(c.ticker, tf, limit);
       if (bars.length < 50) throw new Error(`only ${bars.length} bars`);
-      const res: CandleResponse = { bars, source: c.source, ticker: c.ticker, tf, note: c.note, label: c.label, isProxy: c.isProxy, qtyStep: c.source === 'binance' || /-USD$/.test(c.ticker) ? 0.0001 : c.source === 'binancef' ? 0.001 : 1 };
+      track(c.source, true);
+      const res: CandleResponse = { bars, source: c.source, ticker: c.ticker, tf, note: c.note, label: c.label, isProxy: c.isProxy, instrument: instrumentOf(c.source, c.ticker), fetchedAt: new Date().toISOString(), qtyStep: c.source === 'binance' || /-USD$/.test(c.ticker) ? 0.0001 : c.source === 'binancef' ? 0.001 : 1 };
       cache.set(key, { at: Date.now(), res });
       return res;
     } catch (e) {
+      if (!/API_KEY not set/.test((e as Error).message)) track(c.source, false, (e as Error).message);
       errors.push(`${c.source} ${c.ticker}: ${(e as Error).message}`);
     }
   }
   throw new Error(`No candle data (${errors.join('; ')}). Try another source, or upload a CSV exported from TradingView.`);
 }
+
+/** What kind of instrument a data source actually delivers — shown next to every price. */
+export function instrumentOf(source: SourceKind, ticker: string): string {
+  if (source === 'binancef') return 'Perpetual futures (USDT-margined, Binance)';
+  if (source === 'binance') return /^(PAXG|XAUT)/.test(ticker) ? 'Gold-backed token (crypto spot, Binance)' : 'Crypto spot (Binance)';
+  if (source === 'twelvedata') return /\//.test(ticker) ? (/^X(AU|AG)/.test(ticker) ? 'Spot OTC rate (Twelve Data)' : 'FX spot rate (Twelve Data)') : 'Stock / ETF (Twelve Data)';
+  if (/=F$/.test(ticker)) return 'Exchange futures, continuous front month (Yahoo, delayed)';
+  if (/=X$/.test(ticker)) return 'FX spot rate (Yahoo, delayed)';
+  if (/^\^|DX-Y/.test(ticker)) return 'Index (Yahoo, delayed)';
+  if (/-USD$/.test(ticker)) return 'Crypto USD price (Yahoo)';
+  return 'Stock / ETF (Yahoo, delayed)';
+}
+
+export interface Quote {
+  source: SourceKind;
+  ticker: string;
+  instrument: string;
+  last: number | null;
+  bid: number | null;
+  ask: number | null;
+  spread: number | null;
+  /** Exchange timestamp when the provider gives one; otherwise null and `receivedAt` is the only time. */
+  exchangeTime: string | null;
+  receivedAt: string;
+  delayed: boolean;
+  note: string;
+}
+
+const quoteCache = new Map<string, { at: number; q: Quote }>();
+
+/** Best bid/ask (or last price) from the same source as the candles. Never invents missing fields. */
+export async function getQuote(source: SourceKind, ticker: string): Promise<Quote> {
+  const key = source + ticker;
+  const hit = quoteCache.get(key);
+  if (hit && Date.now() - hit.at < 3000) return hit.q;
+  const receivedAt = new Date().toISOString();
+  const base = { source, ticker, instrument: instrumentOf(source, ticker), receivedAt };
+  let q: Quote;
+  try {
+    q = await fetchQuote(source, ticker, base);
+    track(source, true);
+  } catch (e) {
+    track(source, false, (e as Error).message);
+    throw e;
+  }
+  quoteCache.set(key, { at: Date.now(), q });
+  return q;
+}
+
+async function fetchQuote(source: SourceKind, ticker: string, base: Pick<Quote, 'source' | 'ticker' | 'instrument' | 'receivedAt'>): Promise<Quote> {
+  let q: Quote;
+  if (source === 'binancef' || source === 'binance') {
+    const url = source === 'binancef' ? `https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=${ticker}` : `https://data-api.binance.vision/api/v3/ticker/bookTicker?symbol=${ticker}`;
+    const j = await getJson(url);
+    const bid = Number(j.bidPrice);
+    const ask = Number(j.askPrice);
+    if (!(bid > 0 && ask > 0)) throw new Error('empty order book');
+    q = { ...base, last: (bid + ask) / 2, bid, ask, spread: ask - bid, exchangeTime: j.time ? new Date(j.time).toISOString() : null, delayed: false, note: 'Real-time best bid/ask (mid shown as last).' };
+  } else if (source === 'yahoo') {
+    const j = await getJson(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1m&range=1d`);
+    const m = j.chart?.result?.[0]?.meta;
+    if (!m?.regularMarketPrice) throw new Error('no quote');
+    q = { ...base, last: m.regularMarketPrice, bid: null, ask: null, spread: null, exchangeTime: m.regularMarketTime ? new Date(m.regularMarketTime * 1000).toISOString() : null, delayed: true, note: 'Last trade only; Yahoo does not provide bid/ask here and may be delayed.' };
+  } else {
+    const k = process.env.TWELVEDATA_API_KEY;
+    if (!k) throw new Error('TWELVEDATA_API_KEY not set');
+    const j = await getJson(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(ticker)}&apikey=${k}`);
+    if (!j.price) throw new Error(j.message ?? 'no quote');
+    q = { ...base, last: Number(j.price), bid: null, ask: null, spread: null, exchangeTime: null, delayed: true, note: 'Last price only (Twelve Data plan dependent).' };
+  }
+  return q;
+}
+
+/** Curated, GOLD-first asset list for the dashboard selector. */
+export const DASHBOARD_ASSETS: { symbol: string; label: string; group: string }[] = [
+  { symbol: 'XAUUSDT', label: 'Gold / USDT — Binance perpetual (24/7, real-time)', group: 'Gold' },
+  { symbol: 'PAXGUSDT', label: 'PAX Gold token / USDT — Binance spot', group: 'Gold' },
+  { symbol: 'XAUTUSDT', label: 'Tether Gold token / USDT — Binance spot', group: 'Gold' },
+  { symbol: 'XAUUSD', label: 'Gold — COMEX futures via Yahoo (delayed, may rate-limit)', group: 'Gold' },
+  { symbol: 'XAGUSDT', label: 'Silver / USDT — Binance perpetual', group: 'Metals' },
+  { symbol: 'BTCUSDT', label: 'Bitcoin / USDT — Binance spot', group: 'Crypto' },
+  { symbol: 'ETHUSDT', label: 'Ethereum / USDT — Binance spot', group: 'Crypto' },
+  { symbol: 'SOLUSDT', label: 'Solana / USDT — Binance spot', group: 'Crypto' },
+  { symbol: 'EURUSD', label: 'EUR/USD — Yahoo (delayed)', group: 'FX' },
+  { symbol: 'NAS100', label: 'Nasdaq 100 — Yahoo (delayed)', group: 'Indices' },
+];

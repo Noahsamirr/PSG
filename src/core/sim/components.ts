@@ -651,6 +651,9 @@ const smc: Sim = ({ bars }, p) => {
     seqL: [] as boolean[], seqS: [] as boolean[], bosL: [] as boolean[], bosS: [] as boolean[], chochL: [] as boolean[], chochS: [] as boolean[],
     recentL: [] as boolean[], recentS: [] as boolean[], trend: [] as number[], inObL: [] as boolean[], inObS: [] as boolean[],
     stopL: T.fill(n), stopS: T.fill(n), swH: T.fill(n), swL: T.fill(n),
+    // Active zones per bar (NaN when none), drawn as step lines on the chart.
+    fvgLTop: T.fill(n), fvgLBot: T.fill(n), fvgSTop: T.fill(n), fvgSBot: T.fill(n),
+    obLTop: T.fill(n), obLBot: T.fill(n), obSTop: T.fill(n), obSBot: T.fill(n),
   };
   const events: CompEvent[] = [];
   let swH = NaN, swL = NaN, swHBar = NaN, swLBar = NaN, swHBroken = true, swLBroken = true, trend = 0;
@@ -705,6 +708,8 @@ const smc: Sim = ({ bars }, p) => {
     out.stopS[i] = isN(sweepExtS) || !recentS ? highRef[i] : Math.max(sweepExtS, highRef[i]);
     out.swH[i] = swHBroken ? NaN : swH;
     out.swL[i] = swLBroken ? NaN : swL;
+    out.fvgLTop[i] = fvgLTop; out.fvgLBot[i] = fvgLBot; out.fvgSTop[i] = fvgSTop; out.fvgSBot[i] = fvgSBot;
+    out.obLTop[i] = obLTop; out.obLBot[i] = obLBot; out.obSTop[i] = obSTop; out.obSBot[i] = obSBot;
   }
   const close = bars.map((b) => b.c);
   const showEv = (t: string) => (t === '$' ? bool(p, 'showSweep') : t === 'FVG' ? bool(p, 'showFvg') : bool(p, 'showStruct'));
@@ -718,12 +723,31 @@ const smc: Sim = ({ bars }, p) => {
       discount: both(close.map((c, i) => c < eq[i]), close.map((c, i) => c > eq[i])),
       inOb: both(out.inObL, out.inObS),
     },
-    overlays: bool(p, 'showSweep')
-      ? [
-          { name: 'Buy-side liquidity (swing high)', values: out.swH, color: C.bear, style: 'dotted' },
-          { name: 'Sell-side liquidity (swing low)', values: out.swL, color: C.bull, style: 'dotted' },
-        ]
-      : [],
+    overlays: [
+      ...(bool(p, 'showSweep')
+        ? [
+            { name: 'Buy-side liquidity (swing high)', values: out.swH, color: C.bear, style: 'dotted' as const },
+            { name: 'Sell-side liquidity (swing low)', values: out.swL, color: C.bull, style: 'dotted' as const },
+          ]
+        : []),
+      ...(bool(p, 'showFvg')
+        ? [
+            { name: 'Bullish FVG top', values: out.fvgLTop, color: '#26A69A', style: 'step' as const },
+            { name: 'Bullish FVG bottom', values: out.fvgLBot, color: '#26A69A', style: 'step' as const },
+            { name: 'Bearish FVG top', values: out.fvgSTop, color: '#EF5350', style: 'step' as const },
+            { name: 'Bearish FVG bottom', values: out.fvgSBot, color: '#EF5350', style: 'step' as const },
+          ]
+        : []),
+      ...(bool(p, 'showOb')
+        ? [
+            { name: 'Bullish order block top', values: out.obLTop, color: '#00897B', style: 'dotted' as const },
+            { name: 'Bullish order block bottom', values: out.obLBot, color: '#00897B', style: 'dotted' as const },
+            { name: 'Bearish order block top', values: out.obSTop, color: '#C62828', style: 'dotted' as const },
+            { name: 'Bearish order block bottom', values: out.obSBot, color: '#C62828', style: 'dotted' as const },
+          ]
+        : []),
+      { name: 'Equilibrium (premium above / discount below)', values: eq, color: C.grey, style: 'dotted' as const },
+    ],
     stop: { L: out.stopL, S: out.stopS },
     events: events.filter((e) => showEv(e.text)),
     readout: { label: 'Structure', value: (i) => `${out.trend[i] === 1 ? 'Bullish' : out.trend[i] === -1 ? 'Bearish' : 'Undefined'} · ${close[i] < eq[i] ? 'discount' : 'premium'}` },

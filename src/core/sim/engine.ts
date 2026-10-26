@@ -73,6 +73,8 @@ export interface SimResult {
   };
   notes: string[];
   tfOk: boolean;
+  /** Position still open on the last bar (not yet stopped out or fully at target). */
+  open: (SimTrade & { targets: number[]; filled: boolean }) | null;
 }
 
 export interface SimOptions {
@@ -619,6 +621,7 @@ export function runSimulation(spec: StrategySpec, bars: Bar[], opts: SimOptions)
     overlays: allOverlays,
     levels: lv,
     tfOk,
+    open: cur ? { ...cur, partials: [...cur.partials], targets: cur.tp.slice(0, r.tpCount).filter((_, k) => !(k === 0 && cur!.tp1Done) && !(k === 1 && cur!.tp2Done)), filled: cur.filled } : null,
     info: (i) => ({
       scoreL: scoreL[i],
       scoreS: scoreS[i],

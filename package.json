@@ -17,6 +17,7 @@
     "typecheck": "tsc --noEmit",
     "gen": "tsx scripts/generate-all.ts",
     "docs:catalog": "tsx scripts/gen-catalog-doc.ts",
+    "rank": "tsx scripts/rank-market.mts",
     "lint:generated": "tsx scripts/generate-all.ts && tsx scripts/lint-all.ts"
   },
   "dependencies": {

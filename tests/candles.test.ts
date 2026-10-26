@@ -36,3 +36,11 @@ describe('symbol → data source mapping', () => {
     expect(resolveSource('gold usdt')[0].isProxy).toBe(false);
   });
 });
+
+describe('gold token symbols', () => {
+  it('maps PAXG and XAUT to Binance spot first', () => {
+    expect(resolveSource('PAXGUSDT')[0]).toMatchObject({ source: 'binance', ticker: 'PAXGUSDT', isProxy: false });
+    expect(resolveSource('XAUTUSDT')[0]).toMatchObject({ source: 'binance', ticker: 'XAUTUSDT' });
+    expect(resolveSource('BINANCE:PAXGUSDT')[0].ticker).toBe('PAXGUSDT');
+  });
+});

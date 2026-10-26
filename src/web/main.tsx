@@ -4,6 +4,9 @@ import './styles.css';
 import { api, type Catalog, type Settings } from './api';
 import { AppCtx, Icon, useRoute, useToasts, type Draft } from './components/ui';
 import { Dashboard } from './pages/Dashboard';
+import { Analyze } from './pages/Analyze';
+import { Admin } from './pages/Admin';
+import { Discovery } from './pages/Discovery';
 import { Builder } from './pages/Builder';
 import { Library } from './pages/Library';
 import { Workspace } from './pages/Workspace';
@@ -12,13 +15,18 @@ import { Research } from './pages/Research';
 import { SettingsPage } from './pages/Settings';
 
 const NAV = [
-  { path: '/', label: 'Dashboard', icon: 'home' },
+  { path: '/', label: 'Market Dashboard', icon: 'home' },
+  { path: '/discover', label: 'Strategy Discovery', icon: 'star' },
+  { group: 'Advanced tools' },
+  { path: '/overview', label: 'Scripts Overview', icon: 'layers' },
   { path: '/builder', label: 'Strategy Builder', icon: 'wand' },
   { path: '/library', label: 'Strategy Library', icon: 'book' },
   { path: '/scripts', label: 'Scripts & Launcher', icon: 'code' },
   { path: '/backtests', label: 'Backtest Analysis', icon: 'chart' },
   { path: '/research', label: 'Market Research', icon: 'globe' },
   { path: '/settings', label: 'Settings', icon: 'gear' },
+  { group: 'Administration' },
+  { path: '/admin', label: 'Administrator', icon: 'layers' },
 ];
 
 function App() {
@@ -41,8 +49,23 @@ function App() {
     api.settings().then(setSettings).catch(() => undefined);
   }, []);
   useEffect(() => {
-    api.catalog().then(setCatalog).catch((e) => toast(`Cannot reach the API: ${e.message}`, 'bad'));
-    reloadSettings();
+    // Retry until the API answers (it may be restarting), instead of leaving the app without a catalog.
+    let timer: ReturnType<typeof setTimeout>;
+    let warned = false;
+    const loadCatalog = () =>
+      api
+        .catalog()
+        .then((c) => {
+          setCatalog(c);
+          reloadSettings();
+        })
+        .catch((e) => {
+          if (!warned) toast(`Cannot reach the API: ${e.message} — retrying…`, 'bad');
+          warned = true;
+          timer = setTimeout(loadCatalog, 3000);
+        });
+    loadCatalog();
+    return () => clearTimeout(timer);
   }, [toast, reloadSettings]);
   useEffect(() => {
     if (theme === 'system') document.documentElement.removeAttribute('data-theme');
@@ -75,8 +98,17 @@ function App() {
     case 'settings':
       page = <SettingsPage />;
       break;
-    default:
+    case 'discover':
+      page = <Discovery />;
+      break;
+    case 'admin':
+      page = <Admin />;
+      break;
+    case 'overview':
       page = <Dashboard />;
+      break;
+    default:
+      page = <Analyze />;
   }
   const active = '/' + (top ?? '');
   return (
@@ -91,12 +123,18 @@ function App() {
             </span>
             Pine Forge
           </div>
-          {NAV.map((n) => (
-            <a key={n.path} href={`#${n.path}`} className={`nav-item ${active === n.path || (n.path === '/' && active === '/') ? 'active' : ''}`}>
-              <Icon name={n.icon} />
-              <span>{n.label}</span>
-            </a>
-          ))}
+          {NAV.map((n) =>
+            !n.path ? (
+              <div key={n.group} className="nav-group">
+                {n.group}
+              </div>
+            ) : (
+              <a key={n.path} href={`#${n.path}`} className={`nav-item ${active === n.path || (n.path === '/' && active === '/') ? 'active' : ''}`}>
+                <Icon name={n.icon} />
+                <span>{n.label}</span>
+              </a>
+            ),
+          )}
           <div className="sidebar-foot">
             <label className="field">
               Theme

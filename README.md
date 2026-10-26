@@ -11,6 +11,9 @@ library of researched, documented methods — with clear entry/exit signals, ris
 
 | Area | What you get |
 |---|---|
+| Market Dashboard (home) | GOLD-first: opens on **XAUUSDT** (Binance gold perpetual). Search ~1,600 instruments (Binance spot and perpetuals discovered live, plus curated FX/indices/CME/ETFs); each gold product is listed separately. Header: price, 24h change, bid/ask/spread, exchange timestamp, LIVE/DELAYED/STALE/DISCONNECTED status, provider and session, plus a gold cross-check price. **Activate strategies** from a searchable, categorised library → per-strategy card: BUY/SELL/NO TRADE, confirmed entry vs developing setup, entry/SL/TPs, R:R, rule checks, invalidation, results after costs (out-of-sample and all) → confluence across independent strategy families with score and disagreements → one chart with numbered, merged markers, focus mode and each strategy's own indicators → save opportunities (immutable snapshot) and evaluate forward → **Test all strategies** ranks them on the same candles by out-of-sample expectancy with a minimum-evidence rule → **Pine script** reuses an identical stored version. |
+| Strategy Discovery | Published methodologies (Turtles, Connors RSI(2), Raschke, Bollinger, Ichimoku, Crabel ORB, Carter squeeze, ICT/SMC) with sources, verification status and how this app's independent implementation differs. No originator returns are shown — none are verifiable through an official API. Follow, or test on the dashboard. |
+| Administrator | Behind `ADMIN_TOKEN`: most-used strategies/assets/timeframes, saved-strategy counts, provider reliability, script validation status and generation failures, AI-provider status, strategy review (experimental / awaiting validation / approved / deprecated, with logged notes), minimum-evidence thresholds for rankings. Reviews never alter measured results. |
 | Strategy Builder | Describe a strategy in plain English (offline interpreter, optional AI). It becomes a reviewable, fully editable specification before any code is written. If you don't name a timeframe, the strategy's recommended one is used and shown. |
 | Chart preview | Check a strategy **before copying it**: real candles for any symbol you type — plain or TradingView-style names (`XAUUSD`, `XAUUSDT`, `BINANCE:BTCUSDT.P`, `OANDA:EURUSD`, `TVC:GOLD`, `COMEX:GC1!`, "gold usdt") from Binance spot & USDT perpetuals, Yahoo Finance, Twelve Data, or a CSV exported from TradingView with the script's BUY/SELL and STRONG markers, stop/target levels, indicator overlays, a per-bar rule inspector, trade list and R statistics — computed in the app from the same specification. On every saved script (Chart preview tab) and on drafts (Builder → Preview on chart). |
 | Timeframes | Every script states the chart timeframe to use and its designed range (header, Scripts page, launch steps, on-chart dashboard). On other timeframes a warning banner appears, or entries are blocked if you choose. |
@@ -49,7 +52,8 @@ npm run build && npm start
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | AI interpreter, error explanations and research briefings via Claude (default model `claude-opus-5-5`, server-side refusal fallback enabled) |
 | `LLM_PROVIDER=openai-compatible`, `OPENAI_COMPAT_BASE_URL`, `OPENAI_COMPAT_MODEL`, `OPENAI_COMPAT_API_KEY` | Any OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, OpenAI) |
 | `TWELVEDATA_API_KEY` | Fallback price data for indices/ETFs when Yahoo Finance rate-limits |
-| `DB_PATH` | SQLite file (default `data/pine-forge.db`) |
+| `DB_PATH` | SQLite file (default `data/pine-forge.db`). Tables are created and migrated automatically on start. |
+| `ADMIN_TOKEN` | Enables the Administrator page and `/api/admin/*` (sent as the `x-admin-token` header). Unset = admin disabled. Use a long random value. |
 
 Keys stay on the server and are never sent to the browser. Without any key everything works with the offline interpreter and rule-based briefings.
 
@@ -71,11 +75,17 @@ npm run lint:generated
 
 ## Verification status (honest summary)
 
-- **154 automated tests pass** (generator for all 15 templates × 2 modes and 3 consensus presets, analyzer fixtures, NL interpreter, backtest math, research analysis, REST API).
+- **177 automated tests pass** (generator for all 15 templates × 2 modes and 3 consensus presets, analyzer fixtures, NL interpreter, backtest math, research analysis, REST API).
 - **TradingView compiler:** a coverage script containing all 19 indicator modules and every condition (1,136 lines, strategy mode) and a consensus indicator (553 lines) were checked in TradingView's Pine Editor and returned **0 errors** (one shorttitle warning, since fixed). Running scripts on a chart and in the Strategy Tester requires a TradingView login and was **not** exercised — record your own compile results in the app.
 - **Market research** was run live: 43 of 49 sources succeeded; the failures were Yahoo Finance rate limits, reported in the Sources tab.
 
 ## Known limitations
+
+- Dashboard signals come from the in-app simulation of each strategy, not from TradingView. Quotes are real only where the source provides them (Binance bid/ask); Yahoo is delayed and often rate-limited (HTTP 429) — failures are shown and no signal is produced without valid data.
+- Single-user, local application: no user accounts or per-user data isolation. Do not expose the server to the internet without adding authentication (see `docs/AUDIT.md`).
+- Quotes are polled (5 s) rather than streamed over WebSocket; funding costs of perpetuals are not modelled.
+- No live or copy trading. Strategy following = tracking and simulated evaluation only.
+- Full audit, provider limits and the TradingView capability matrix: [`docs/AUDIT.md`](docs/AUDIT.md), [`docs/DATA_PROVIDERS.md`](docs/DATA_PROVIDERS.md).
 
 - TradingView has no public API to create/compile/attach scripts; launching is a guided copy-paste flow.
 - The static analyzer is not a compiler; type-qualifier and runtime errors can still appear in TradingView.

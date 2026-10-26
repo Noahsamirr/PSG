@@ -34,7 +34,12 @@ import {
 } from '../core';
 import type { Store } from './db';
 import { extractJson, type LlmProvider } from './llm';
-import { getCandles, POPULAR_SYMBOLS, resolveSource } from './candles';
+import { timingSafeEqual } from 'node:crypto';
+import { getCandles, getQuote, POPULAR_SYMBOLS, providerStats, resolveSource, type CandleResponse, type Quote } from './candles';
+import { CURATED, findInstrument, loadCatalog, searchCatalog } from './catalog';
+import type { ReviewStatus } from './db';
+import { DISCOVERY } from '../core/discovery';
+import { checkBars, confluence, evaluateOutcome, evaluateStrategy, evidenceOf, levelIssues, rankStrategies, specForTemplate, specHash, type RankRow, type StrategySignal } from '../core/signals';
 import { DEFAULT_WATCHLIST, runResearch, topicCounts, type ResearchReport, type WatchItem } from './research';
 
 class HttpError extends Error {
@@ -445,6 +450,312 @@ export function createApp(store: Store, llm: LlmProvider) {
   app.get('/api/candles/popular', (_req, res) => {
     res.json(POPULAR_SYMBOLS);
   });
+
+  // ─── Analysis dashboard: market data, signals, rankings, saved opportunities ───
+  const limiter = new Map<string, number[]>();
+  /** Small in-memory rate limit for the expensive endpoints (per client IP). */
+  const rateLimit = (req: Request, key: string, perMinute: number) => {
+    const id = `${key}:${req.ip}`;
+    const now = Date.now();
+    const hits = (limiter.get(id) ?? []).filter((t) => now - t < 60_000);
+    if (hits.length >= perMinute) throw new HttpError(429, `Too many requests — limit is ${perMinute} per minute. Try again shortly.`);
+    hits.push(now);
+    limiter.set(id, hits);
+  };
+  const GOLD_TICKERS = ['XAUUSDT', 'PAXGUSDT', 'XAUTUSDT', 'GC=F', 'GLD', 'XAU/USD'];
+  const loadMarket = async (q: Record<string, unknown>) => {
+    const tf = String(q.tf ?? '60');
+    const source = q.source ? String(q.source) : undefined;
+    const ticker = q.ticker ? String(q.ticker).slice(0, 40) : undefined;
+    const symbol = String(q.symbol ?? ticker ?? 'XAUUSDT').slice(0, 40);
+    let candles: CandleResponse;
+    try {
+      candles = await getCandles({ symbol, tf, limit: Math.min(Number(q.limit ?? 1500), 3000), source: (source as never) ?? 'auto', ticker });
+    } catch (e) {
+      throw new HttpError(502, `Market data unavailable for ${ticker ?? symbol}: ${(e as Error).message}`);
+    }
+    const { bars, check } = checkBars(candles.bars, candles.tf);
+    let quote: Quote | null = null;
+    let quoteError: string | null = null;
+    try {
+      quote = await getQuote(candles.source, candles.ticker);
+    } catch (e) {
+      quoteError = (e as Error).message;
+    }
+    const cat = await loadCatalog();
+    const inst = findInstrument(cat.list, candles.source, candles.ticker);
+    // 24h change from closed candles (or the live quote) — never extrapolated.
+    const last = bars[bars.length - 1];
+    let change: { abs: number; pct: number; since: string } | null = null;
+    if (last) {
+      const ref = [...bars].reverse().find((b) => b.t <= last.t - 24 * 3600_000) ?? bars[0];
+      const px = quote?.last ?? last.c;
+      change = { abs: px - ref.c, pct: (100 * (px - ref.c)) / ref.c, since: new Date(ref.t).toISOString() };
+    }
+    // Gold: show a second, independent gold price so a bad feed is visible instead of silently trusted.
+    let crossCheck: { source: string; ticker: string; last: number; diffPct: number; note: string } | null = null;
+    if (GOLD_TICKERS.includes(candles.ticker) && quote?.last) {
+      const [rs, rt] = candles.ticker === 'XAUUSDT' ? (['binance', 'PAXGUSDT'] as const) : (['binancef', 'XAUUSDT'] as const);
+      try {
+        const rq = await getQuote(rs, rt);
+        if (rq.last) crossCheck = { source: rs, ticker: rt, last: rq.last, diffPct: (100 * (quote.last - rq.last)) / rq.last, note: rt === 'PAXGUSDT' ? 'PAXG is a gold-backed token and can trade at a small premium/discount to gold.' : 'Binance gold perpetual (tracks spot gold).' };
+      } catch {
+        /* reference unavailable — shown as missing, not guessed */
+      }
+    }
+    const market = {
+      symbol,
+      source: candles.source,
+      ticker: candles.ticker,
+      name: inst?.name ?? candles.label.split(' — ')[1] ?? candles.ticker,
+      instrument: candles.instrument,
+      provider: inst?.provider ?? candles.label.split(' ')[0],
+      quoteCurrency: inst?.quoteCurrency ?? (candles.ticker.endsWith('USDT') ? 'USDT' : 'USD'),
+      session: inst?.session ?? '',
+      realtime: inst?.realtime ?? (candles.source === 'binance' || candles.source === 'binancef'),
+      label: candles.label,
+      note: candles.note,
+      isProxy: candles.isProxy,
+      tf: candles.tf,
+      fetchedAt: candles.fetchedAt,
+      data: check,
+      quote,
+      quoteError,
+      change,
+      crossCheck,
+    };
+    return { market, bars, allBars: candles.bars, qtyStep: candles.qtyStep };
+  };
+  app.get('/api/market/assets', (_req, res) => {
+    res.json(CURATED);
+  });
+  app.get(
+    '/api/market/search',
+    wrap(async (req) => {
+      const cat = await loadCatalog();
+      return { results: searchCatalog(cat.list, String(req.query.q ?? '').slice(0, 40)), total: cat.list.length, errors: cat.errors };
+    }),
+  );
+  app.get(
+    '/api/market/quote',
+    wrap(async (req) => {
+      const source = String(req.query.source ?? '');
+      if (!['binance', 'binancef', 'yahoo', 'twelvedata'].includes(source)) throw new HttpError(400, 'Unknown data source');
+      try {
+        return await getQuote(source as never, String(req.query.ticker ?? '').slice(0, 40));
+      } catch (e) {
+        throw new HttpError(502, `Quote unavailable: ${(e as Error).message}`);
+      }
+    }),
+  );
+  app.get(
+    '/api/strategies',
+    wrap(() => {
+      const reviews = store.listReviews();
+      return TEMPLATES.map((t) => ({ id: t.id, name: t.name, category: t.category, family: t.family, summary: t.summary, timeframes: t.timeframes, tfRange: t.tfRange, review: reviews[t.id] ?? { status: 'experimental', note: '', updatedAt: null } }));
+    }),
+  );
+  app.post(
+    '/api/signals',
+    wrap(async (req) => {
+      rateLimit(req, 'signals', 40);
+      const ids: string[] = Array.isArray(req.body?.strategies) ? req.body.strategies.map(String).slice(0, 8) : [];
+      if (!ids.length) throw new HttpError(400, 'Pick at least one strategy.');
+      for (const id of ids) if (!TEMPLATES.some((t) => t.id === id)) throw new HttpError(400, `Unknown strategy "${id}"`);
+      let m: Awaited<ReturnType<typeof loadMarket>>;
+      try {
+        m = await loadMarket(req.body ?? {});
+      } catch (e) {
+        store.logEvent('signal_error', { symbol: String(req.body?.ticker ?? req.body?.symbol ?? ''), tf: String(req.body?.tf ?? ''), detail: (e as Error).message });
+        throw e;
+      }
+      const activated: string[] = Array.isArray(req.body?.activated) ? req.body.activated.map(String) : [];
+      for (const id of activated.filter((x) => ids.includes(x))) store.logEvent('activate', { symbol: m.market.ticker, tf: m.market.tf, strategyId: id });
+      // Invalid data never produces actionable signals.
+      const signals: StrategySignal[] = ids.map((id) => {
+        const spec = specForTemplate(id, m.market.tf, m.market.ticker);
+        return evaluateStrategy(spec, m.market.data.ok ? m.bars : [], m.market.tf, { qtyStep: m.qtyStep, templateId: id });
+      });
+      return { market: m.market, bars: m.allBars, signals, confluence: confluence(signals) };
+    }),
+  );
+  app.post(
+    '/api/rankings',
+    wrap(async (req) => {
+      rateLimit(req, 'rankings', 6);
+      const m = await loadMarket(req.body ?? {});
+      if (!m.market.data.ok) throw new HttpError(422, `Cannot rank on invalid data: ${m.market.data.issues.join(' ')}`);
+      const minTrades = store.getSetting<number>('ranking.minTrades', 30);
+      const minOos = store.getSetting<number>('ranking.minOos', 10);
+      const reviews = store.listReviews();
+      const rows: RankRow[] = TEMPLATES.map((t) => {
+        const s = evaluateStrategy(specForTemplate(t.id, m.market.tf, m.market.ticker), m.bars, m.market.tf, { qtyStep: m.qtyStep, templateId: t.id, withSeries: false });
+        return { strategyId: t.id, strategyName: t.name, family: t.family, category: t.category, strategyVersion: s.strategyVersion, all: s.all, outOfSample: s.outOfSample, evidence: evidenceOf(s.all, s.outOfSample, minTrades, minOos), tfOk: s.tfOk };
+      });
+      return {
+        market: m.market,
+        bars: { count: m.bars.length, from: new Date(m.bars[0].t).toISOString(), to: m.market.data.lastClosedAt },
+        minTrades,
+        minOos,
+        rows: rankStrategies(rows).map((r) => ({ ...r, review: reviews[r.strategyId]?.status ?? 'experimental' })),
+        method: `Every strategy runs on the same ${m.bars.length} closed ${m.market.ticker} bars with the same execution model (next-bar-open fills, ${'commission + slippage'}, conservative same-candle rule). Ranked by out-of-sample expectancy (last 30% of bars, after costs). "High evidence" needs ≥ ${minTrades} trades and ≥ ${minOos} out-of-sample trades; others are listed as insufficient evidence. Past results on one market and period do not predict future results.`,
+      };
+    }),
+  );
+  app.post(
+    '/api/strategy-script',
+    wrap((req) => {
+      const id = String(req.body?.strategyId ?? '');
+      if (!TEMPLATES.some((t) => t.id === id)) throw new HttpError(400, `Unknown strategy "${id}"`);
+      const tf = String(req.body?.tf ?? '60');
+      const sym = String(req.body?.symbol ?? '');
+      const spec = specForTemplate(id, tf, sym);
+      const hash = specHash(spec);
+      const existing = store.findVersionByHash(hash, specHash);
+      if (existing) {
+        store.logEvent('script', { symbol: sym, tf, strategyId: id, detail: 'reused' });
+        return { reused: true, scriptId: existing.scriptId, version: existing.version, validation: existing.validation, strategyVersion: hash };
+      }
+      const art = buildArtifacts(spec);
+      if (art.validation.errorCount > 0) {
+        // Invalid scripts are not stored as reusable versions.
+        store.logEvent('script_fail', { symbol: sym, tf, strategyId: id, detail: `${art.validation.errorCount} validation error(s)` });
+        throw new HttpError(422, `Generated script failed validation with ${art.validation.errorCount} error(s); it was not saved.`);
+      }
+      const script = store.createScript(`${spec.meta.name} · ${spec.market.symbol || 'any'} · ${spec.market.timeframe}`, spec.output);
+      const v = store.addVersion(script.id, { code: art.code, spec, validation: art.validation, log: art.log, note: 'Generated from the market dashboard', output: spec.output });
+      store.logEvent('script', { symbol: sym, tf, strategyId: id, detail: 'generated' });
+      return { reused: false, scriptId: script.id, version: v.version, validation: v.validation, strategyVersion: hash };
+    }),
+  );
+  app.get('/api/opportunities', wrap(() => store.listOpportunities()));
+  app.post(
+    '/api/opportunities',
+    wrap((req) => {
+      const b = req.body ?? {};
+      const sig = b.signal as StrategySignal | undefined;
+      const mk = b.market as { symbol: string; source: string; ticker: string; instrument: string; tf: string } | undefined;
+      if (!sig || !mk || (sig.state !== 'BUY' && sig.state !== 'SELL')) throw new HttpError(400, 'Only a BUY or SELL signal can be saved.');
+      if (sig.entry == null || sig.stop == null || !sig.signalTime || !Array.isArray(sig.targets) || !sig.targets.length) throw new HttpError(400, 'Signal is missing entry, stop or targets.');
+      const issues = levelIssues(sig.state === 'BUY' ? 1 : -1, Number(sig.entry), Number(sig.stop), sig.targets.map(Number));
+      if (issues.length) throw new HttpError(400, `Inconsistent levels: ${issues.join(' ')}`);
+      const o = store.addOpportunity({
+        symbol: String(mk.symbol),
+        source: String(mk.source),
+        ticker: String(mk.ticker),
+        instrument: String(mk.instrument),
+        tf: String(mk.tf),
+        strategyId: String(sig.strategyId),
+        strategyName: String(sig.strategyName),
+        strategyVersion: String(sig.strategyVersion),
+        direction: sig.state === 'BUY' ? 1 : -1,
+        signalTime: sig.signalTime,
+        entry: Number(sig.entry),
+        stop: Number(sig.stop),
+        targets: sig.targets.map(Number),
+        snapshot: { signal: { ...sig, markers: undefined, indicators: undefined, levels: undefined, events: undefined, exits: undefined }, market: b.market, confluence: b.confluence ?? null },
+        note: String(b.note ?? '').slice(0, 500),
+      });
+      store.logEvent('save', { symbol: o.ticker, tf: o.tf, strategyId: o.strategyId });
+      return o;
+    }),
+  );
+  app.get(
+    '/api/opportunities/:id',
+    wrap((req) => {
+      const o = store.getOpportunity(String(req.params.id));
+      if (!o) throw new HttpError(404, 'Opportunity not found');
+      return o;
+    }),
+  );
+  app.get(
+    '/api/opportunities/:id/evaluate',
+    wrap(async (req) => {
+      const o = store.getOpportunity(String(req.params.id));
+      if (!o) throw new HttpError(404, 'Opportunity not found');
+      let candles: CandleResponse;
+      try {
+        candles = await getCandles({ symbol: o.ticker, tf: o.tf, limit: 1500, source: o.source as never, ticker: o.ticker });
+      } catch (e) {
+        throw new HttpError(502, `Cannot evaluate — market data unavailable: ${(e as Error).message}`);
+      }
+      const { bars } = checkBars(candles.bars, candles.tf);
+      // Outcomes are measured forward only, from the first bar that opened after the opportunity was saved.
+      return evaluateOutcome({ dir: o.direction, entry: o.entry, stop: o.stop, targets: o.targets, savedAt: Date.parse(o.createdAt) }, bars);
+    }),
+  );
+  app.delete(
+    '/api/opportunities/:id',
+    wrap((req) => ({ deleted: store.deleteOpportunity(String(req.params.id)) })),
+  );
+
+  // ─── Strategy discovery: published methodologies mapped to independent implementations ───
+  app.get('/api/discovery', (_req, res) => {
+    res.json(DISCOVERY);
+  });
+
+  // ─── Administrator (requires ADMIN_TOKEN; separate from the user workflow) ───
+  const requireAdmin = (req: Request) => {
+    const token = process.env.ADMIN_TOKEN;
+    if (!token) throw new HttpError(503, 'Administrator access is disabled. Set ADMIN_TOKEN in the server environment to enable it.');
+    const given = Buffer.from(String(req.headers['x-admin-token'] ?? ''));
+    const want = Buffer.from(token);
+    if (given.length !== want.length || !timingSafeEqual(given, want)) throw new HttpError(401, 'Administrator token missing or invalid.');
+  };
+  app.get(
+    '/api/admin/overview',
+    wrap((req) => {
+      requireAdmin(req);
+      const since = req.query.since ? String(req.query.since) : undefined;
+      const scripts = store.listScripts().map((s) => {
+        const v = store.getVersion(s.id, s.latestVersion);
+        return { id: s.id, name: s.name, version: s.latestVersion, errors: v?.validation && (v.validation as any).errorCount, warnings: v?.validation && (v.validation as any).warningCount, compiled: v?.compile ?? null, updatedAt: s.updatedAt };
+      });
+      const gen = store.countEvents('script', 'strategy_id', since).reduce((a, x) => a + x.count, 0);
+      const fails = store.countEvents('script_fail', 'strategy_id', since).reduce((a, x) => a + x.count, 0);
+      return {
+        usage: {
+          strategies: store.countEvents('activate', 'strategy_id', since),
+          saved: store.countEvents('save', 'strategy_id', since),
+          assets: store.countEvents('activate', 'symbol', since),
+          timeframes: store.countEvents('activate', 'tf', since),
+        },
+        scripts: { awaitingCompile: scripts.filter((s) => !s.compiled), withErrors: scripts.filter((s) => (s.errors ?? 0) > 0), total: scripts.length, generationFailRate: gen + fails ? fails / (gen + fails) : null, recentFailures: store.recentEvents('script_fail', 10) },
+        providers: providerStats,
+        signalErrors: store.recentEvents('signal_error', 15),
+        reviews: store.listReviews(),
+        reviewLog: store.reviewLog(),
+        ranking: { minTrades: store.getSetting<number>('ranking.minTrades', 30), minOos: store.getSetting<number>('ranking.minOos', 10) },
+        llm: llm.status(),
+      };
+    }),
+  );
+  app.put(
+    '/api/admin/strategies/:id/review',
+    wrap((req) => {
+      requireAdmin(req);
+      const id = String(req.params.id);
+      if (!TEMPLATES.some((t) => t.id === id)) throw new HttpError(404, 'Unknown strategy');
+      const status = String(req.body?.status ?? '') as ReviewStatus;
+      if (!['experimental', 'awaiting_validation', 'approved', 'deprecated'].includes(status)) throw new HttpError(400, 'Invalid status');
+      const note = String(req.body?.note ?? '').slice(0, 500);
+      if (status === 'approved' && !note) throw new HttpError(400, 'Approval needs a note naming the evidence (asset, timeframe, period, trade count).');
+      store.setReview(id, status, note);
+      return { ok: true, review: store.listReviews()[id] };
+    }),
+  );
+  app.put(
+    '/api/admin/ranking',
+    wrap((req) => {
+      requireAdmin(req);
+      const minTrades = Math.round(Number(req.body?.minTrades));
+      const minOos = Math.round(Number(req.body?.minOos));
+      if (!(minTrades >= 10 && minTrades <= 1000) || !(minOos >= 5 && minOos <= minTrades)) throw new HttpError(400, 'minTrades must be 10–1000 and minOos 5–minTrades.');
+      store.setSetting('ranking.minTrades', minTrades);
+      store.setSetting('ranking.minOos', minOos);
+      return { minTrades, minOos };
+    }),
+  );
 
   // ─── Market research ───
   let running: Promise<ResearchReport> | null = null;

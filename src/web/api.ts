@@ -1,6 +1,8 @@
 // Typed client for the Pine Forge API.
 import type { ComponentDef, Diagnostic, Family, StrategySpec, TemplateDef, ValidationReport, Metrics, Trade, Flag, MonteCarloResult, Resource, TopicStat, NewsItem, RegimeResult, CalendarEvent, ConsensusSpec } from '../core';
 
+import type { StrategySignal, Confluence, OutcomeEval, DataCheck, RankRow } from '../core/signals';
+import type { MethodProfile } from '../core/discovery';
 export type { StrategySpec, TemplateDef, ValidationReport, Diagnostic, Metrics, Trade, Flag, Resource };
 
 export interface CatalogComponent extends Omit<ComponentDef, 'emit' | 'helpers' | 'structureStop'> {
@@ -122,7 +124,130 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   return data as T;
 }
 
+export interface Instrument {
+  id: string;
+  source: string;
+  ticker: string;
+  name: string;
+  assetClass: string;
+  kind: string;
+  quoteCurrency: string;
+  provider: string;
+  session: string;
+  realtime: boolean;
+  needsKey?: boolean;
+}
+export interface Quote {
+  source: string;
+  ticker: string;
+  last: number | null;
+  bid: number | null;
+  ask: number | null;
+  spread: number | null;
+  exchangeTime: string | null;
+  receivedAt: string;
+  delayed: boolean;
+  note: string;
+}
+export interface MarketInfo {
+  symbol: string;
+  source: string;
+  ticker: string;
+  name: string;
+  instrument: string;
+  provider: string;
+  quoteCurrency: string;
+  session: string;
+  realtime: boolean;
+  label: string;
+  note: string;
+  isProxy: boolean;
+  tf: string;
+  fetchedAt: string;
+  data: DataCheck;
+  quote: Quote | null;
+  quoteError: string | null;
+  change: { abs: number; pct: number; since: string } | null;
+  crossCheck: { source: string; ticker: string; last: number; diffPct: number; note: string } | null;
+}
+export interface SignalsResponse {
+  market: MarketInfo;
+  bars: { t: number; o: number; h: number; l: number; c: number; v: number }[];
+  signals: StrategySignal[];
+  confluence: Confluence;
+}
+export interface Opportunity {
+  id: string;
+  createdAt: string;
+  symbol: string;
+  source: string;
+  ticker: string;
+  instrument: string;
+  tf: string;
+  strategyId: string;
+  strategyName: string;
+  strategyVersion: string;
+  direction: 1 | -1;
+  signalTime: string;
+  entry: number;
+  stop: number;
+  targets: number[];
+  snapshot: { signal?: Partial<StrategySignal>; market?: Partial<MarketInfo>; confluence?: Confluence | null };
+  note: string;
+}
+export type ReviewStatus = 'experimental' | 'awaiting_validation' | 'approved' | 'deprecated';
+export interface StrategyInfo {
+  id: string;
+  name: string;
+  category: string;
+  family: Family;
+  summary: string;
+  timeframes: string;
+  tfRange?: [string, string];
+  review: { status: ReviewStatus; note: string; updatedAt: string | null };
+}
+export interface Rankings {
+  market: MarketInfo;
+  bars: { count: number; from: string; to: string | null };
+  minTrades: number;
+  minOos: number;
+  rows: (RankRow & { review: ReviewStatus })[];
+  method: string;
+}
+export interface AdminOverview {
+  usage: Record<'strategies' | 'saved' | 'assets' | 'timeframes', { key: string; count: number }[]>;
+  scripts: { awaitingCompile: { id: string; name: string; version: number; errors?: number; warnings?: number }[]; withErrors: { id: string; name: string; version: number; errors?: number }[]; total: number; generationFailRate: number | null; recentFailures: { at: string; strategyId: string; detail: string }[] };
+  providers: Record<string, { ok: number; fail: number; lastError: string | null; lastErrorAt: string | null; lastOkAt: string | null }>;
+  signalErrors: { at: string; symbol: string; tf: string; detail: string }[];
+  reviews: Record<string, { status: ReviewStatus; note: string; updatedAt: string }>;
+  reviewLog: { strategyId: string; status: string; note: string; at: string }[];
+  ranking: { minTrades: number; minOos: number };
+  llm: { provider: string; model: string | null; configured: boolean; note: string };
+}
+export type { StrategySignal, Confluence, OutcomeEval, DataCheck, RankRow, MethodProfile };
+
+async function callAuth<T>(method: string, path: string, token: string, body?: unknown): Promise<T> {
+  const res = await fetch(`/api${path}`, { method, headers: { 'x-admin-token': token, ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error((data as { error?: string }).error ?? `Request failed (${res.status})`);
+  return data as T;
+}
+
 export const api = {
+  searchInstruments: (q: string) => call<{ results: Instrument[]; total: number; errors: string[] }>('GET', `/market/search?q=${encodeURIComponent(q)}`),
+  quote: (source: string, ticker: string) => call<Quote>('GET', `/market/quote?source=${encodeURIComponent(source)}&ticker=${encodeURIComponent(ticker)}`),
+  strategies: () => call<StrategyInfo[]>('GET', '/strategies'),
+  signals: (body: { source: string; ticker: string; tf: string; strategies: string[]; activated?: string[] }) => call<SignalsResponse>('POST', '/signals', body),
+  rankings: (body: { source: string; ticker: string; tf: string }) => call<Rankings>('POST', '/rankings', body),
+  strategyScript: (body: { strategyId: string; tf: string; symbol: string }) => call<{ reused: boolean; scriptId: string; version: number; validation: ValidationReport; strategyVersion: string }>('POST', '/strategy-script', body),
+  opportunities: () => call<Opportunity[]>('GET', '/opportunities'),
+  saveOpportunity: (body: { signal: StrategySignal; market: MarketInfo; confluence: Confluence; note?: string }) => call<Opportunity>('POST', '/opportunities', body),
+  evaluateOpportunity: (id: string) => call<OutcomeEval>('GET', `/opportunities/${id}/evaluate`),
+  deleteOpportunity: (id: string) => call<{ deleted: boolean }>('DELETE', `/opportunities/${id}`),
+  discovery: () => call<MethodProfile[]>('GET', '/discovery'),
+  admin: (token: string) => callAuth<AdminOverview>('GET', '/admin/overview', token),
+  adminReview: (token: string, id: string, status: ReviewStatus, note: string) => callAuth<{ ok: boolean }>('PUT', `/admin/strategies/${id}/review`, token, { status, note }),
+  adminRanking: (token: string, minTrades: number, minOos: number) => callAuth<{ minTrades: number; minOos: number }>('PUT', '/admin/ranking', token, { minTrades, minOos }),
   catalog: () => call<Catalog>('GET', '/catalog'),
   resources: () => call<Resource[]>('GET', '/resources'),
   settings: () => call<Settings>('GET', '/settings'),

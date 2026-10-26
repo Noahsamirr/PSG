@@ -39,6 +39,38 @@ export interface BacktestRow {
   createdAt: string;
 }
 
+export interface OpportunityRow {
+  id: string;
+  createdAt: string;
+  symbol: string;
+  source: string;
+  ticker: string;
+  instrument: string;
+  tf: string;
+  strategyId: string;
+  strategyName: string;
+  strategyVersion: string;
+  direction: 1 | -1;
+  signalTime: string;
+  entry: number;
+  stop: number;
+  targets: number[];
+  /** The full signal + data status at save time. Never modified afterwards. */
+  snapshot: unknown;
+  note: string;
+}
+
+export type ReviewStatus = 'experimental' | 'awaiting_validation' | 'approved' | 'deprecated';
+
+export interface UsageEvent {
+  at: string;
+  type: 'activate' | 'save' | 'script' | 'script_fail' | 'signal_error';
+  symbol: string;
+  tf: string;
+  strategyId: string;
+  detail: string;
+}
+
 export class Store {
   private db: DatabaseSync;
 
@@ -59,6 +91,23 @@ export class Store {
         trades_json TEXT NOT NULL, initial_capital REAL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS research_reports (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, report_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS opportunities (
+        id TEXT PRIMARY KEY, created_at TEXT NOT NULL, symbol TEXT NOT NULL, source TEXT NOT NULL, ticker TEXT NOT NULL,
+        instrument TEXT NOT NULL, tf TEXT NOT NULL, strategy_id TEXT NOT NULL, strategy_name TEXT NOT NULL,
+        strategy_version TEXT NOT NULL, direction INTEGER NOT NULL CHECK (direction IN (1, -1)),
+        signal_time TEXT NOT NULL, entry REAL NOT NULL, stop REAL NOT NULL, targets_json TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL, note TEXT NOT NULL DEFAULT '');
+      CREATE TABLE IF NOT EXISTS usage_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,
+        type TEXT NOT NULL CHECK (type IN ('activate', 'save', 'script', 'script_fail', 'signal_error')),
+        symbol TEXT NOT NULL DEFAULT '', tf TEXT NOT NULL DEFAULT '', strategy_id TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '');
+      CREATE INDEX IF NOT EXISTS usage_events_type ON usage_events(type, at);
+      CREATE TABLE IF NOT EXISTS strategy_reviews (
+        strategy_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL CHECK (status IN ('experimental', 'awaiting_validation', 'approved', 'deprecated')),
+        note TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS strategy_review_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, strategy_id TEXT NOT NULL, status TEXT NOT NULL, note TEXT NOT NULL, at TEXT NOT NULL);
     `);
   }
 
@@ -172,6 +221,90 @@ export class Store {
 
   listReports(limit = 10): { id: string; createdAt: string; report: any }[] {
     return (this.db.prepare('SELECT * FROM research_reports ORDER BY created_at DESC LIMIT ?').all(limit) as any[]).map((r) => ({ id: r.id, createdAt: r.created_at, report: JSON.parse(r.report_json) }));
+  }
+
+  addOpportunity(o: Omit<OpportunityRow, 'id' | 'createdAt'>): OpportunityRow {
+    const id = randomUUID();
+    this.db
+      .prepare(
+        'INSERT INTO opportunities (id, created_at, symbol, source, ticker, instrument, tf, strategy_id, strategy_name, strategy_version, direction, signal_time, entry, stop, targets_json, snapshot_json, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(id, this.now(), o.symbol, o.source, o.ticker, o.instrument, o.tf, o.strategyId, o.strategyName, o.strategyVersion, o.direction, o.signalTime, o.entry, o.stop, JSON.stringify(o.targets), JSON.stringify(o.snapshot), o.note);
+    return this.getOpportunity(id)!;
+  }
+
+  private mapOpportunity(r: any): OpportunityRow {
+    return {
+      id: r.id,
+      createdAt: r.created_at,
+      symbol: r.symbol,
+      source: r.source,
+      ticker: r.ticker,
+      instrument: r.instrument,
+      tf: r.tf,
+      strategyId: r.strategy_id,
+      strategyName: r.strategy_name,
+      strategyVersion: r.strategy_version,
+      direction: r.direction,
+      signalTime: r.signal_time,
+      entry: r.entry,
+      stop: r.stop,
+      targets: JSON.parse(r.targets_json),
+      snapshot: JSON.parse(r.snapshot_json),
+      note: r.note,
+    };
+  }
+
+  listOpportunities(): OpportunityRow[] {
+    return (this.db.prepare('SELECT * FROM opportunities ORDER BY created_at DESC').all() as any[]).map((r) => this.mapOpportunity(r));
+  }
+
+  getOpportunity(id: string): OpportunityRow | null {
+    const r = this.db.prepare('SELECT * FROM opportunities WHERE id = ?').get(id);
+    return r ? this.mapOpportunity(r) : null;
+  }
+
+  deleteOpportunity(id: string) {
+    return this.db.prepare('DELETE FROM opportunities WHERE id = ?').run(id).changes > 0;
+  }
+
+  /** Latest stored version whose spec hash matches — lets the dashboard reuse an existing script. */
+  findVersionByHash(hash: string, hashOf: (spec: any) => string): VersionRow | null {
+    for (const s of this.listScripts()) {
+      const v = this.getVersion(s.id, s.latestVersion);
+      if (v && hashOf(v.spec) === hash) return v;
+    }
+    return null;
+  }
+
+  logEvent(type: UsageEvent['type'], e: { symbol?: string; tf?: string; strategyId?: string; detail?: string } = {}) {
+    this.db.prepare('INSERT INTO usage_events (at, type, symbol, tf, strategy_id, detail) VALUES (?, ?, ?, ?, ?, ?)').run(this.now(), type, e.symbol ?? '', e.tf ?? '', e.strategyId ?? '', (e.detail ?? '').slice(0, 500));
+  }
+
+  /** Counts per key for one event type, optionally since an ISO date. */
+  countEvents(type: UsageEvent['type'], by: 'symbol' | 'tf' | 'strategy_id', since?: string): { key: string; count: number }[] {
+    return (this.db.prepare(`SELECT ${by} AS key, COUNT(*) AS count FROM usage_events WHERE type = ? AND at >= ? GROUP BY ${by} ORDER BY count DESC LIMIT 20`).all(type, since ?? '') as any[]).map((r) => ({ key: r.key, count: Number(r.count) }));
+  }
+
+  recentEvents(type: UsageEvent['type'], limit = 20): UsageEvent[] {
+    return (this.db.prepare('SELECT * FROM usage_events WHERE type = ? ORDER BY id DESC LIMIT ?').all(type, limit) as any[]).map((r) => ({ at: r.at, type: r.type, symbol: r.symbol, tf: r.tf, strategyId: r.strategy_id, detail: r.detail }));
+  }
+
+  listReviews(): Record<string, { status: ReviewStatus; note: string; updatedAt: string }> {
+    const out: Record<string, { status: ReviewStatus; note: string; updatedAt: string }> = {};
+    for (const r of this.db.prepare('SELECT * FROM strategy_reviews').all() as any[]) out[r.strategy_id] = { status: r.status, note: r.note, updatedAt: r.updated_at };
+    return out;
+  }
+
+  /** Review status changes are logged; they never touch the measured performance. */
+  setReview(strategyId: string, status: ReviewStatus, note: string) {
+    const t = this.now();
+    this.db.prepare('INSERT INTO strategy_reviews (strategy_id, status, note, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(strategy_id) DO UPDATE SET status = excluded.status, note = excluded.note, updated_at = excluded.updated_at').run(strategyId, status, note, t);
+    this.db.prepare('INSERT INTO strategy_review_log (strategy_id, status, note, at) VALUES (?, ?, ?, ?)').run(strategyId, status, note, t);
+  }
+
+  reviewLog(limit = 30): { strategyId: string; status: string; note: string; at: string }[] {
+    return (this.db.prepare('SELECT * FROM strategy_review_log ORDER BY id DESC LIMIT ?').all(limit) as any[]).map((r) => ({ strategyId: r.strategy_id, status: r.status, note: r.note, at: r.at }));
   }
 
   getSetting<T>(key: string, fallback: T): T {
