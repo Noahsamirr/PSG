@@ -83,7 +83,7 @@ export function PineEditor({ value, onChange, readOnly, height = '620px', gotoLi
     view.focus();
   }, [gotoLine]);
   return (
-    <div className="cm-wrap">
+    <div className="cm-wrap" dir="ltr">
       <CodeMirror ref={ref as never} value={value} height={height} extensions={extensions} editable={!readOnly} readOnly={readOnly} onChange={onChange} basicSetup={{ foldGutter: false, highlightActiveLine: !readOnly }} theme="none" />
     </div>
   );
@@ -97,5 +97,5 @@ export function PineDiff({ a, b }: { a: string; b: string }) {
     const mv = new MergeView({ a: { doc: a, extensions: ext }, b: { doc: b, extensions: ext }, parent: host.current, collapseUnchanged: { margin: 3, minSize: 6 }, gutter: true });
     return () => mv.destroy();
   }, [a, b]);
-  return <div className="cm-wrap" ref={host} style={{ maxHeight: 640, overflow: 'auto' }} />;
+  return <div className="cm-wrap" dir="ltr" ref={host} style={{ maxHeight: 640, overflow: 'auto' }} />;
 }

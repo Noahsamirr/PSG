@@ -17,6 +17,8 @@ export interface DataCheck {
   lastClosedAt: string | null;
   ageMinutes: number | null;
   droppedFormingBar: boolean;
+  /** Live mode: the still-forming candle is included, so its signals can change until it closes. */
+  liveCandle: boolean;
   issues: string[];
 }
 
@@ -24,14 +26,15 @@ export interface DataCheck {
  * Validates OHLC bars and removes the still-forming last bar, so signals use confirmed bars only
  * (the same rule the generated Pine scripts follow with barstate.isconfirmed).
  */
-export function checkBars(barsIn: Bar[], tf: string, now = Date.now()): { bars: Bar[]; check: DataCheck } {
+export function checkBars(barsIn: Bar[], tf: string, now = Date.now(), opts: { live?: boolean } = {}): { bars: Bar[]; check: DataCheck } {
   const issues: string[] = [];
   const min = tfMinutes(tf);
-  if (!min) return { bars: [], check: { ok: false, status: 'invalid', lastClosedAt: null, ageMinutes: null, droppedFormingBar: false, issues: [`Unknown timeframe ${tf}`] } };
+  if (!min) return { bars: [], check: { ok: false, status: 'invalid', lastClosedAt: null, ageMinutes: null, droppedFormingBar: false, liveCandle: false, issues: [`Unknown timeframe ${tf}`] } };
   const ms = min * 60000;
   let bars = barsIn;
   let dropped = false;
-  if (bars.length && bars[bars.length - 1].t + ms > now) {
+  const forming = bars.length > 0 && bars[bars.length - 1].t + ms > now;
+  if (forming) {
     bars = bars.slice(0, -1);
     dropped = true;
   }
@@ -61,15 +64,41 @@ export function checkBars(barsIn: Bar[], tf: string, now = Date.now()): { bars: 
   const age = last ? (now - (last.t + ms)) / 60000 : null;
   const stale = !invalid && age !== null && age > Math.max(2 * min, 5);
   if (stale) issues.push(`Last closed bar ended ${Math.round(age!)} min ago — market closed or feed delayed. Signals are shown as of that bar.`);
+  // Live mode puts the forming candle back after the checks; its values change until it closes.
+  const live = !!opts.live && forming && !invalid;
+  if (live) issues.push('Live candles: the newest candle has not closed yet, so its signal can still appear or disappear.');
   return {
-    bars: invalid ? [] : bars,
-    check: { ok: !invalid, status: invalid ? 'invalid' : stale ? 'stale' : 'live', lastClosedAt: last ? new Date(last.t + ms).toISOString() : null, ageMinutes: age === null ? null : Math.round(age * 10) / 10, droppedFormingBar: dropped, issues },
+    bars: invalid ? [] : live ? barsIn : bars,
+    check: { ok: !invalid, status: invalid ? 'invalid' : stale ? 'stale' : 'live', lastClosedAt: last ? new Date(last.t + ms).toISOString() : null, ageMinutes: age === null ? null : Math.round(age * 10) / 10, droppedFormingBar: dropped && !live, liveCandle: live, issues },
   };
 }
 
 export function specHash(spec: StrategySpec): string {
   const { meta: _m, notes: _n, ...rest } = spec;
   return createHash('sha256').update(JSON.stringify(rest)).digest('hex').slice(0, 12);
+}
+
+export interface Probability {
+  /** Share of past trades that ended in profit after costs (0–1). */
+  p: number;
+  /** 95% Wilson interval for p. */
+  lo: number;
+  hi: number;
+  /** Number of past trades it is based on. */
+  n: number;
+}
+
+/** Empirical probability of profit with a 95% Wilson interval (a defined, testable estimate, not a guess). */
+export function probabilityOf(results: TradeResult[]): Probability | null {
+  const n = results.length;
+  if (!n) return null;
+  const w = results.filter((t) => t.r >= BE).length;
+  const p = w / n;
+  const z = 1.96;
+  const den = 1 + (z * z) / n;
+  const centre = (p + (z * z) / (2 * n)) / den;
+  const half = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / den;
+  return { p, lo: Math.max(0, centre - half), hi: Math.min(1, centre + half), n };
 }
 
 /** One completed position = one trade, however many partial targets it took. */
@@ -198,6 +227,8 @@ export interface StrategySignal {
   /** True when the strategy-mode market order has not filled yet (fills at the next bar open). */
   pendingFill: boolean;
   stop: number | null;
+  /** The stop has moved from its starting level (breakeven or trailing), so it can now be beyond the entry. */
+  stopMoved: boolean;
   targets: number[];
   rewardRisk: number | null;
   tfOk: boolean;
@@ -207,6 +238,11 @@ export interface StrategySignal {
   inSample: PerfSummary;
   outOfSample: PerfSummary;
   all: PerfSummary;
+  /**
+   * Probability of profit for this strategy on this market and timeframe: share of its past trades that made money
+   * after costs. `inSample` is the estimate from older data, `outOfSample` what then happened on newer data.
+   */
+  probability: { all: Probability | null; inSample: Probability | null; outOfSample: Probability | null };
   splitTime: string | null;
   costNote: string;
   /** Entry signals; `why` lists the rules that were met on that candle. */
@@ -264,6 +300,7 @@ export function evaluateStrategy(spec: StrategySpec, bars: Bar[], tf: string, op
     entry: null,
     pendingFill: false,
     stop: null,
+    stopMoved: false,
     targets: [],
     rewardRisk: null,
     tfOk: true,
@@ -273,6 +310,7 @@ export function evaluateStrategy(spec: StrategySpec, bars: Bar[], tf: string, op
     inSample: empty,
     outOfSample: empty,
     all: empty,
+    probability: { all: null, inSample: null, outOfSample: null },
     splitTime: null,
     costNote: `Costs: ${spec.backtest.commissionValue}% commission per side and ${spec.backtest.slippageTicks} ticks slippage; market orders fill at the next bar open; a target and the stop inside one candle count as a stop.`,
     markers: [],
@@ -296,6 +334,7 @@ export function evaluateStrategy(spec: StrategySpec, bars: Bar[], tf: string, op
   out.inSample = perf(results.filter((_, k) => done[k].entryBar < split));
   out.outOfSample = perf(results.filter((_, k) => done[k].entryBar >= split));
   out.all = perf(results);
+  out.probability = { all: probabilityOf(results), inSample: probabilityOf(results.filter((_, k) => done[k].entryBar < split)), outOfSample: probabilityOf(results.filter((_, k) => done[k].entryBar >= split)) };
   out.splitTime = new Date(bars[split].t).toISOString();
   out.tfOk = res.tfOk;
   // Entry price = the trade's fill price (next candle open + slippage in strategy mode), or the signal close if not filled yet.
@@ -346,7 +385,8 @@ export function evaluateStrategy(spec: StrategySpec, bars: Bar[], tf: string, op
     return out;
   }
   const targets = o.targets;
-  const issues = levelIssues(o.dir, o.entry, o.stop, targets);
+  // Check the levels the trade was opened with: a trailed stop may legitimately sit beyond the entry (locked-in profit).
+  const issues = levelIssues(o.dir, o.entry, o.initialStop, targets);
   if (issues.length) {
     out.issues = issues;
     out.reason = `Signal withheld — inconsistent levels: ${issues.join(' ')}`;
@@ -362,6 +402,7 @@ export function evaluateStrategy(spec: StrategySpec, bars: Bar[], tf: string, op
   out.entry = o.entry;
   out.pendingFill = !o.filled;
   out.stop = o.stop;
+  out.stopMoved = o.stop !== o.initialStop;
   out.targets = targets;
   out.reasons = ruleChecks(o.signalBar, side);
   out.ruleScore = side === 'L' ? info.scoreL : info.scoreS;

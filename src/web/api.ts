@@ -3,6 +3,9 @@ import type { ComponentDef, Diagnostic, Family, StrategySpec, TemplateDef, Valid
 
 import type { StrategySignal, Confluence, OutcomeEval, DataCheck, RankRow } from '../core/signals';
 import type { MethodProfile } from '../core/discovery';
+import type { TradePlan } from '../core/plans';
+import type { Trigger } from '../core/outlook';
+import type { Action, AnalystDecision, MarketContext } from '../core/analyst';
 export type { StrategySpec, TemplateDef, ValidationReport, Diagnostic, Metrics, Trade, Flag, Resource };
 
 export interface CatalogComponent extends Omit<ComponentDef, 'emit' | 'helpers' | 'structureStop'> {
@@ -195,6 +198,72 @@ export interface Opportunity {
   snapshot: { signal?: Partial<StrategySignal>; market?: Partial<MarketInfo>; confluence?: Confluence | null };
   note: string;
 }
+export interface OutlookStrategy {
+  strategyId: string;
+  strategyName: string;
+  family: string;
+  state: 'BUY' | 'SELL' | 'NO TRADE';
+  stage: 'confirmed' | 'setup' | 'none';
+  setupDir: 1 | -1 | 0;
+  isNew: boolean;
+  signalTime: string | null;
+  entry: number | null;
+  stop: number | null;
+  targets: number[];
+  reason: string;
+  tfOk: boolean;
+  probability: StrategySignal['probability'];
+  trades: number;
+  expectancyR: number | null;
+  triggers: Trigger[];
+  searched: { low: number; high: number };
+}
+export interface OutlookFrame {
+  tf: string;
+  error: string | null;
+  price?: number | null;
+  formingOpen?: number | null;
+  formingCloseAt?: string | null;
+  live?: boolean;
+  data?: DataCheck;
+  strategies: OutlookStrategy[];
+}
+
+export interface AnalystRun {
+  id: string;
+  name: string;
+  model: string | null;
+  kind: 'rules' | 'ai';
+  status: 'ok' | 'cached' | 'rejected' | 'error' | 'duplicate';
+  decision: AnalystDecision | null;
+  error: string | null;
+  problems: string[];
+  ms: number;
+}
+export interface AnalystProvider {
+  id: string;
+  name: string;
+  envKey: string;
+  modelEnv: string;
+  signupUrl: string;
+  free: string;
+  configured: boolean;
+}
+export interface AnalystResponse {
+  engine: 'panel' | 'rules';
+  aiConfigured: boolean;
+  decision: AnalystDecision;
+  verdict: { action: Action; votes: Record<Action, number>; counted: number; agree: number; summary: string; chosenFrom: string | null; waitFor: string[] };
+  analysts: AnalystRun[];
+  providers: AnalystProvider[];
+  context: MarketContext | null;
+  price: number;
+  levelsConsidered: number;
+  evidence: { tf: string; dataStatus: string; buy: number; sell: number; strategies: number }[];
+  news: { title: string; country: string; time: number; impact: string }[];
+  generatedAt: string;
+}
+
 export type ReviewStatus = 'experimental' | 'awaiting_validation' | 'approved' | 'deprecated';
 export interface StrategyInfo {
   id: string;
@@ -224,7 +293,7 @@ export interface AdminOverview {
   ranking: { minTrades: number; minOos: number };
   llm: { provider: string; model: string | null; configured: boolean; note: string };
 }
-export type { StrategySignal, Confluence, OutcomeEval, DataCheck, RankRow, MethodProfile };
+export type { StrategySignal, Confluence, OutcomeEval, DataCheck, RankRow, MethodProfile, TradePlan, Trigger };
 
 async function callAuth<T>(method: string, path: string, token: string, body?: unknown): Promise<T> {
   const res = await fetch(`/api${path}`, { method, headers: { 'x-admin-token': token, ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
@@ -237,7 +306,10 @@ export const api = {
   searchInstruments: (q: string) => call<{ results: Instrument[]; total: number; errors: string[] }>('GET', `/market/search?q=${encodeURIComponent(q)}`),
   quote: (source: string, ticker: string) => call<Quote>('GET', `/market/quote?source=${encodeURIComponent(source)}&ticker=${encodeURIComponent(ticker)}`),
   strategies: () => call<StrategyInfo[]>('GET', '/strategies'),
-  signals: (body: { source: string; ticker: string; tf: string; strategies: string[]; activated?: string[] }) => call<SignalsResponse>('POST', '/signals', body),
+  signals: (body: { source: string; ticker: string; tf: string; strategies: string[]; activated?: string[]; live?: boolean; limit?: number }) => call<SignalsResponse>('POST', '/signals', body),
+  outlook: (body: { source: string; ticker: string; strategies: string[]; tfs?: string[]; live?: boolean }) => call<{ ticker: string; frames: OutlookFrame[] }>('POST', '/outlook', body),
+  tradePlans: (body: { source: string; ticker: string; tf: string; live?: boolean }) => call<{ market: MarketInfo; plans: TradePlan[]; evaluated: number }>('POST', '/trade-plans', body),
+  analyst: (body: { source: string; ticker: string; focusTf: string; strategies: string[]; live?: boolean; useAI?: boolean }) => call<AnalystResponse>('POST', '/analyst', body),
   rankings: (body: { source: string; ticker: string; tf: string }) => call<Rankings>('POST', '/rankings', body),
   strategyScript: (body: { strategyId: string; tf: string; symbol: string }) => call<{ reused: boolean; scriptId: string; version: number; validation: ValidationReport; strategyVersion: string }>('POST', '/strategy-script', body),
   opportunities: () => call<Opportunity[]>('GET', '/opportunities'),

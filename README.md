@@ -49,11 +49,17 @@ npm run build && npm start
 
 | Variable | Purpose |
 |---|---|
+| `GEMINI_API_KEY`, `GEMINI_MODEL` | Google Gemini (free tier available from Google AI Studio; default model `gemini-3.5-flash`, which answers in seconds on the free tier). Used first when set. Powers the trade analyst and the other AI features |
+| `GEMINI_SECOND_MODEL` | A second Gemini model (default `gemini-3.1-flash-lite`) that votes as its own analyst; `off` to disable |
+| `GROQ_API_KEY`, `CEREBRAS_API_KEY`, `MISTRAL_API_KEY`, `OPENROUTER_API_KEY`, `GITHUB_MODELS_TOKEN`, `HF_TOKEN`, `OLLAMA_MODEL` (+ optional `*_MODEL`) | Each adds one more free AI analyst to the trade analyst panel. Without a model name the app lists the provider's models and picks a strong one (and re-picks when a model is retired). See `.env.example` for sign-up links |
+| `AI_ANALYSTS_OFF` | Comma list of analysts to leave out, e.g. `anthropic` |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | AI interpreter, error explanations and research briefings via Claude (default model `claude-opus-5-5`, server-side refusal fallback enabled) |
 | `LLM_PROVIDER=openai-compatible`, `OPENAI_COMPAT_BASE_URL`, `OPENAI_COMPAT_MODEL`, `OPENAI_COMPAT_API_KEY` | Any OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, OpenAI) |
 | `TWELVEDATA_API_KEY` | Fallback price data for indices/ETFs when Yahoo Finance rate-limits |
 | `DB_PATH` | SQLite file (default `data/pine-forge.db`). Tables are created and migrated automatically on start. |
 | `ADMIN_TOKEN` | Enables the Administrator page and `/api/admin/*` (sent as the `x-admin-token` header). Unset = admin disabled. Use a long random value. |
+
+**Trade analyst panel.** The rule-based analyst plus every configured AI receive the same evidence (all strategies on 5m–1H with their measured track records, next trigger prices, high-impact news, and the daily picture of the asset, the dollar, US yields and headlines from the latest research report). Each AI may only pick prices by level id; every answer is validated. The answers are then combined by vote: BUY or SELL needs more than half of the analysts that answered and almost none pointing the other way (with fewer than four analysts, none), otherwise the panel says WAIT. Two analysts that end up on the same model count once.
 
 Keys stay on the server and are never sent to the browser. Without any key everything works with the offline interpreter and rule-based briefings.
 

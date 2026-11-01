@@ -7,6 +7,7 @@ import { TF_LADDER, tfLabel } from '../../core/timeframe';
 import type { StrategySpec } from '../../core/types';
 import { api } from '../api';
 import { Badge, Card, fmt, Icon, Spinner, useApp } from './ui';
+import { useI18n } from '../i18n';
 
 type Pick = 'auto' | `c${number}` | 'custom' | 'csv';
 type Candidate = Awaited<ReturnType<typeof api.candleSources>>[number];
@@ -60,6 +61,7 @@ interface Props {
 
 export function ChartPreview({ spec, footer }: Props) {
   const { toast } = useApp();
+  const { t, tx } = useI18n();
   const [symbol, setSymbol] = useState(spec.market.symbol || 'BTCUSDT');
   const [tf, setTf] = useState(spec.market.timeframe || '60');
   const [limit, setLimit] = useState(1000);
@@ -198,7 +200,7 @@ export function ChartPreview({ spec, footer }: Props) {
     <div className="col">
       <div className="row">
         <label className="field" style={{ width: 210 }}>
-          Symbol
+          {t('Symbol')}
           <input
             list="pf-symbols"
             value={symbol}
@@ -217,7 +219,7 @@ export function ChartPreview({ spec, footer }: Props) {
           </datalist>
         </label>
         <label className="field" style={{ width: 110 }}>
-          Timeframe
+          {t('Timeframe')}
           <select value={tf} onChange={(e) => setTf(e.target.value)} disabled={source === 'csv'}>
             {[...new Set([...TF_LADDER, tf])].map((t) => (
               <option key={t} value={t}>
@@ -228,7 +230,7 @@ export function ChartPreview({ spec, footer }: Props) {
           </select>
         </label>
         <label className="field" style={{ width: 100 }}>
-          Bars
+          {t('Bars')}
           <select value={limit} onChange={(e) => setLimit(Number(e.target.value))} disabled={source === 'csv'}>
             {[500, 1000, 2000, 3000].map((n) => (
               <option key={n}>{n}</option>
@@ -236,22 +238,25 @@ export function ChartPreview({ spec, footer }: Props) {
           </select>
         </label>
         <label className="field" style={{ width: 330 }}>
-          Data source
+          {t('Data source')}
           <select value={pick} onChange={(e) => setPick(e.target.value as Pick)}>
-            <option value="auto">Auto — best available{candidates[0] ? ` (${candidates[0].label.split(' — ')[0]})` : ''}</option>
+            <option value="auto">
+              {t('Auto — best available')}
+              {candidates[0] ? ` (${candidates[0].label.split(' — ')[0]})` : ''}
+            </option>
             {candidates.map((c, k) => (
               <option key={k} value={`c${k}`}>
                 {c.label}
               </option>
             ))}
-            <option value="custom">Custom source & ticker…</option>
-            <option value="csv">Upload CSV exported from TradingView</option>
+            <option value="custom">{t('Custom source & ticker…')}</option>
+            <option value="csv">{t('Upload CSV exported from TradingView')}</option>
           </select>
         </label>
         {pick === 'custom' && (
           <>
             <label className="field" style={{ width: 150 }}>
-              Source
+              {t('Source')}
               <select value={customSource} onChange={(e) => setCustomSource(e.target.value)}>
                 <option value="binance">Binance spot</option>
                 <option value="binancef">Binance futures (USDT perps)</option>
@@ -260,14 +265,14 @@ export function ChartPreview({ spec, footer }: Props) {
               </select>
             </label>
             <label className="field" style={{ width: 130 }}>
-              Ticker
+              {t('Ticker')}
               <input value={ticker} onChange={(e) => setTicker(e.target.value)} placeholder={customSource.startsWith('binance') ? 'XAUUSDT' : customSource === 'yahoo' ? 'EURUSD=X' : 'EUR/USD'} />
             </label>
           </>
         )}
         {source === 'csv' ? (
           <label className="field">
-            CSV file
+            {t('CSV file')}
             <input
               type="file"
               accept=".csv,.txt"
@@ -292,7 +297,7 @@ export function ChartPreview({ spec, footer }: Props) {
           </label>
         ) : (
           <button className="btn primary" onClick={load} disabled={loading} style={{ alignSelf: 'flex-end' }}>
-            {loading ? <Spinner /> : <Icon name="refresh" size={16} />} Load & run
+            {loading ? <Spinner /> : <Icon name="refresh" size={16} />} {t('Load & run')}
           </button>
         )}
       </div>
@@ -306,7 +311,7 @@ export function ChartPreview({ spec, footer }: Props) {
           ] as const
         ).map(([k, label]) => (
           <label key={k} className="check small">
-            <input type="checkbox" checked={show[k]} onChange={(e) => setShow({ ...show, [k]: e.target.checked })} /> {label}
+            <input type="checkbox" checked={show[k]} onChange={(e) => setShow({ ...show, [k]: e.target.checked })} /> {t(label)}
           </label>
         ))}
       </div>
@@ -315,18 +320,18 @@ export function ChartPreview({ spec, footer }: Props) {
         <div className="row small muted">
           <Badge tone={data.isProxy ? 'warn' : 'info'}>{data.label}</Badge>
           <span>
-            {data.bars.length} bars · {tfLabel(data.tf)} · {new Date(data.bars[0].t).toISOString().slice(0, 10)} → {new Date(data.bars[data.bars.length - 1].t).toISOString().slice(0, 16).replace('T', ' ')} UTC
+            {t('{n} bars', { n: data.bars.length })} · {tfLabel(data.tf)} · {new Date(data.bars[0].t).toISOString().slice(0, 10)} → {new Date(data.bars[data.bars.length - 1].t).toISOString().slice(0, 16).replace('T', ' ')} UTC
           </span>
           <span>{data.note}</span>
           {result && !result.tfOk && <Badge tone="warn">outside designed timeframe</Badge>}
         </div>
       )}
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 280px', gap: 12 }} className="chart-grid">
-        <div ref={holder} style={{ height: 520, border: '1px solid var(--line)', borderRadius: 10, overflow: 'hidden', background: 'var(--surface)' }} role="img" aria-label="Price chart with strategy signals">
-          {!data && !loading && <div className="empty">Load data to preview signals.</div>}
+        <div ref={holder} dir="ltr" style={{ height: 520, border: '1px solid var(--line)', borderRadius: 10, overflow: 'hidden', background: 'var(--surface)' }} role="img" aria-label={t('Price chart with strategy signals')}>
+          {!data && !loading && <div className="empty">{t('Load data to preview signals.')}</div>}
           {loading && (
             <div className="empty">
-              <Spinner /> Loading candles…
+              <Spinner /> {t('Loading candles…')}
             </div>
           )}
         </div>
@@ -343,7 +348,7 @@ export function ChartPreview({ spec, footer }: Props) {
                 <div className="col" style={{ gap: 4 }}>
                   {barMarkers.map((m, k) => (
                     <div key={k} className={`notice ${m.kind === 'blocked' || m.kind === 'invalid' ? '' : m.dir === 1 ? 'good' : m.dir === -1 ? 'bad' : ''}`} style={{ padding: '6px 8px' }}>
-                      <strong>{m.text}</strong> {m.detail}
+                      <strong>{m.text}</strong> <span dir="auto">{tx(m.detail)}</span>
                     </div>
                   ))}
                 </div>
@@ -364,7 +369,7 @@ export function ChartPreview({ spec, footer }: Props) {
               ) : (
                 <div>
                   <h4>
-                    Rules · long {fmt(info.scoreL, 0)}% · short {fmt(info.scoreS, 0)}%
+                    {t('Rules · long {l}% · short {s}%', { l: fmt(info.scoreL, 0), s: fmt(info.scoreS, 0) })}
                   </h4>
                   {info.conds.map((c) => (
                     <div key={c.label + c.role} className="row" style={{ gap: 6, flexWrap: 'nowrap' }}>
@@ -374,12 +379,12 @@ export function ChartPreview({ spec, footer }: Props) {
                       <span title="short" style={{ color: c.S ? 'var(--bad-ink)' : 'var(--ink-3)', width: 14 }}>
                         {c.S ? '✓' : '✗'}
                       </span>
-                      <span className="grow">{c.label}</span>
-                      <span className="muted">{c.role}</span>
+                      <span className="grow">{t(c.label)}</span>
+                      <span className="muted">{t(c.role)}</span>
                     </div>
                   ))}
                   <p className="muted" style={{ margin: '4px 0 0' }}>
-                    First column = long side, second = short side.
+                    {t('First column = long side, second = short side.')}
                   </p>
                 </div>
               )}
@@ -394,11 +399,11 @@ export function ChartPreview({ spec, footer }: Props) {
                 </dl>
               )}
               <p className="muted" style={{ margin: 0 }}>
-                Hover the chart to inspect any bar.
+                {t('Hover the chart to inspect any bar.')}
               </p>
             </div>
           ) : (
-            <span className="muted">Bar details appear here.</span>
+            <span className="muted">{t('Bar details appear here.')}</span>
           )}
         </div>
       </div>
@@ -406,87 +411,89 @@ export function ChartPreview({ spec, footer }: Props) {
         <>
           <div className="grid g4">
             <div className="card stat">
-              <div className="label">Signals / trades</div>
+              <div className="label">{t('Signals / trades')}</div>
               <div className="value num">
                 {s.signals} / {s.trades}
               </div>
               <div className="sub">
-                {s.blocked} not traded{spec.consensus.enabled ? ` · ${s.strongSignals} STRONG` : ''}
+                {t('{n} not traded', { n: s.blocked })}{spec.consensus.enabled ? ` · ${s.strongSignals} STRONG` : ''}
               </div>
             </div>
             <div className="card stat">
-              <div className="label">Win rate</div>
+              <div className="label">{t('Win rate')}</div>
               <div className="value num">{s.winRate === null ? '—' : `${s.winRate.toFixed(0)}%`}</div>
               <div className="sub">
-                {s.wins} wins · {s.losses} losses
+                {t('{w} wins · {l} losses', { w: s.wins, l: s.losses })}
               </div>
             </div>
             <div className="card stat">
-              <div className="label">Total R (before costs)</div>
+              <div className="label">{t('Total R (before costs)')}</div>
               <div className="value num">
                 {s.totalR >= 0 ? '+' : ''}
                 {s.totalR.toFixed(1)}R
               </div>
-              <div className="sub">avg {s.avgR === null ? '—' : `${s.avgR.toFixed(2)}R`} · PF {fmt(s.profitFactor)}</div>
+              <div className="sub">{t('avg {a} · PF {pf}', { a: s.avgR === null ? '—' : `${s.avgR.toFixed(2)}R`, pf: fmt(s.profitFactor) })}</div>
             </div>
             <div className="card stat">
-              <div className="label">Net P&L (after commission)</div>
+              <div className="label">{t('Net P&L (after commission)')}</div>
               <div className="value num">{fmt(s.netPnl)}</div>
-              <div className="sub">max DD {s.maxDrawdownPct.toFixed(1)}% · start {fmt(spec.backtest.initialCapital, 0)}</div>
+              <div className="sub">{t('max DD {dd}% · start {c}', { dd: s.maxDrawdownPct.toFixed(1), c: fmt(spec.backtest.initialCapital, 0) })}</div>
             </div>
           </div>
-          <div className="notice small">
+          <div className="notice small" dir="auto">
             {result.notes.map((n) => (
-              <div key={n}>• {n}</div>
+              <div key={n} dir="auto">
+                • {tx(n)}
+              </div>
             ))}
-            <div>• A short preview window is weak evidence. Confirm in TradingView's Strategy Tester and with out-of-sample data before trusting results.</div>
+            <div>• {t("A short preview window is weak evidence. Confirm in TradingView's Strategy Tester and with out-of-sample data before trusting results.")}</div>
           </div>
-          <Card title={`Trades (${result.trades.length})`} pad={false}>
+          <Card title={t('Trades ({n})', { n: result.trades.length })} pad={false}>
             {result.trades.length === 0 ? (
-              <div className="empty">No completed trades in this window.</div>
+              <div className="empty">{t('No completed trades in this window.')}</div>
             ) : (
               <div className="table-wrap" style={{ maxHeight: 320, overflow: 'auto' }}>
                 <table>
                   <thead>
                     <tr>
                       <th>#</th>
-                      <th>Side</th>
-                      <th>Signal (UTC)</th>
-                      <th className="num">Entry</th>
-                      <th className="num">Stop</th>
-                      <th>Exit (UTC)</th>
-                      <th>Reason</th>
+                      <th>{t('Side')}</th>
+                      <th>{t('Signal (UTC)')}</th>
+                      <th className="num">{t('Entry')}</th>
+                      <th className="num">{t('Stop')}</th>
+                      <th>{t('Exit (UTC)')}</th>
+                      <th>{t('Reason')}</th>
                       <th className="num">R</th>
-                      <th className="num">P&L</th>
+                      <th className="num">{t('P&L')}</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {result.trades.map((t, k) => (
-                      <tr key={k} className="clickable" onClick={() => jumpTo(t.signalBar)}>
+                    {result.trades.map((tr, k) => (
+                      <tr key={k} className="clickable" onClick={() => jumpTo(tr.signalBar)}>
                         <td>{k + 1}</td>
                         <td>
-                          <Badge tone={t.dir === 1 ? 'good' : 'bad'}>
-                            {t.strong ? 'STRONG ' : ''}
-                            {t.dir === 1 ? 'Long' : 'Short'}
+                          <Badge tone={tr.dir === 1 ? 'good' : 'bad'}>
+                            {tr.strong ? `${t('STRONG')} ` : ''}
+                            {t(tr.dir === 1 ? 'BUY' : 'SELL')}
                           </Badge>
                         </td>
-                        <td className="nowrap">{new Date(data!.bars[t.signalBar].t).toISOString().slice(0, 16).replace('T', ' ')}</td>
-                        <td className="num">{dp(t.entry)}</td>
-                        <td className="num" title={t.stop !== t.initialStop ? `Moved to ${dp(t.stop)} (breakeven/trailing)` : ''}>
-                          {dp(t.initialStop)}
-                          {t.stop !== t.initialStop && <span className="muted"> → {dp(t.stop)}</span>}
+                        <td className="nowrap">{new Date(data!.bars[tr.signalBar].t).toISOString().slice(0, 16).replace('T', ' ')}</td>
+                        <td className="num">{dp(tr.entry)}</td>
+                        <td className="num" title={tr.stop !== tr.initialStop ? `Moved to ${dp(tr.stop)} (breakeven/trailing)` : ''}>
+                          {dp(tr.initialStop)}
+                          {tr.stop !== tr.initialStop && <span className="muted"> → {dp(tr.stop)}</span>}
                         </td>
-                        <td className="nowrap">{t.exitBar !== null ? new Date(data!.bars[t.exitBar].t).toISOString().slice(0, 16).replace('T', ' ') : 'open'}</td>
+                        <td className="nowrap">{tr.exitBar !== null ? new Date(data!.bars[tr.exitBar].t).toISOString().slice(0, 16).replace('T', ' ') : t('open')}</td>
                         <td>
-                          {t.partials
+                          {tr.partials
                             .map((p) => p.label)
                             .filter((x, i2, a) => a.indexOf(x) === i2)
                             .join(' → ')}
                         </td>
                         <td className="num">
-                          {t.r === null ? '—' : `${t.r >= 0 ? '+' : ''}${t.r.toFixed(2)}`}
+                          {tr.r === null ? '—' : `${tr.r >= 0 ? '+' : ''}${tr.r.toFixed(2)}`}
                         </td>
-                        <td className="num">{fmt(t.pnl)}</td>
+                        <td className="num">{fmt(tr.pnl)}</td>
                       </tr>
                     ))}
                   </tbody>

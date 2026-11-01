@@ -3,6 +3,8 @@
 import { useEffect, useState } from 'react';
 import { api, type MethodProfile } from '../api';
 import { Badge, Card, Spinner, useApp } from '../components/ui';
+import { useI18n } from '../i18n';
+import { DISCOVERY_AR } from '../i18n/discovery-ar';
 
 const FIDELITY: Record<MethodProfile['fidelity'], { tone: 'good' | 'warn' | 'neutral'; label: string }> = {
   close: { tone: 'good', label: 'Independent implementation — close to published rules' },
@@ -12,6 +14,9 @@ const FIDELITY: Record<MethodProfile['fidelity'], { tone: 'good' | 'warn' | 'neu
 
 export function Discovery() {
   const { go, toast } = useApp();
+  const { t, lang } = useI18n();
+  // Arabic text for a profile field when available, otherwise the original.
+  const L = (p: MethodProfile) => (lang === 'ar' ? { ...p, ...DISCOVERY_AR[p.id] } : p);
   const [list, setList] = useState<MethodProfile[] | null>(null);
   const [followed, setFollowed] = useState<string[]>(() => {
     try {
@@ -41,7 +46,7 @@ export function Discovery() {
         const used = new Set(Object.values(slots));
         const free = [0, 1, 2, 3, 4, 5].find((k) => !used.has(k));
         if (free === undefined) {
-          toast('Six strategies are already active — deactivate one on the dashboard first.', 'bad');
+          toast(t('Six strategies are already active — deactivate one on the dashboard first.'), 'bad');
           return;
         }
         slots[p.templateId] = free;
@@ -57,50 +62,48 @@ export function Discovery() {
     <div>
       <div className="page-head">
         <div>
-          <h1>Strategy discovery</h1>
-          <p>
-            Methodologies published by well-known traders and educators. No platform offers verified trading records for these people through an official API, so no returns or win rates are shown for them. What you see is the published rule set, its source, and how faithfully this app re-implements it.
-            Test an implementation on the dashboard to see its results on your market.
-          </p>
+          <h1>{t('Strategy Discovery')}</h1>
+          <p>{t('Methodologies published by well-known traders and educators. No platform offers verified trading records for these people through an official API, so no returns or win rates are shown for them. What you see is the published rule set, its source, and how faithfully this app re-implements it. Test an implementation on the dashboard to see its results on your market.')}</p>
         </div>
       </div>
       {!sorted ? (
         <Spinner />
       ) : (
         <div className="signal-grid">
-          {sorted.map((p) => {
+          {sorted.map((orig) => {
+            const p = L(orig);
             const f = FIDELITY[p.fidelity];
             const on = followed.includes(p.id);
             return (
-              <Card key={p.id} title={p.name} actions={<Badge tone={f.tone}>{p.fidelity === 'not-implemented' ? 'not implemented' : p.fidelity}</Badge>}>
+              <Card key={p.id} title={p.name} actions={<Badge tone={f.tone}>{t(p.fidelity === 'not-implemented' ? 'not implemented' : p.fidelity)}</Badge>}>
                 <div style={{ fontSize: 13, lineHeight: 1.55 }}>
                   <div>
                     <b>{p.originator}</b>
                   </div>
                   <div className="muted" style={{ fontSize: 12 }}>
-                    Source: {p.source} · {p.published}
+                    {t('Source: {s} · {p}', { s: p.source, p: p.published })}
                   </div>
                   <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
                     {p.style} · {p.markets} · {p.timeframe}
                   </div>
                   <div>
-                    <b>Entry:</b> {p.entry}
+                    <b>{t('Entry:')}</b> {p.entry}
                   </div>
                   <div>
-                    <b>Exit:</b> {p.exit}
+                    <b>{t('Exit:')}</b> {p.exit}
                   </div>
                   <div>
-                    <b>Risk:</b> {p.risk}
+                    <b>{t('Risk:')}</b> {p.risk}
                   </div>
                   <div style={{ marginTop: 6 }}>
-                    <Badge tone="neutral">Originator results: {p.evidence}</Badge>
+                    <Badge tone="neutral">{t('Originator results: {e}', { e: t(p.evidence) })}</Badge>
                   </div>
                   <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-                    {p.verification}
+                    {t(p.verification)}
                   </div>
                   <details style={{ marginTop: 6 }}>
                     <summary className="sum">
-                      {f.label} — {p.differences.length} difference{p.differences.length === 1 ? '' : 's'}
+                      {lang === 'ar' ? t('{f} — {n} difference(s)', { f: t(f.label), n: p.differences.length }) : `${f.label} — ${p.differences.length} difference${p.differences.length === 1 ? '' : 's'}`}
                     </summary>
                     <ul className="checks">
                       {p.differences.map((d) => (
@@ -108,15 +111,15 @@ export function Discovery() {
                       ))}
                     </ul>
                     <div className="muted" style={{ fontSize: 12 }}>
-                      {p.licensing}
+                      {t(p.licensing)}
                     </div>
                   </details>
                   <div className="row" style={{ marginTop: 10 }}>
-                    <button className="btn sm primary" disabled={!p.templateId} onClick={() => activate(p)}>
-                      Test on dashboard
+                    <button className="btn sm primary" disabled={!p.templateId} onClick={() => activate(orig)}>
+                      {t('Test on dashboard')}
                     </button>
-                    <button className="btn sm" onClick={() => follow(p)}>
-                      {on ? 'Following ✓' : 'Follow'}
+                    <button className="btn sm" onClick={() => follow(orig)}>
+                      {t(on ? 'Following ✓' : 'Follow')}
                     </button>
                   </div>
                 </div>

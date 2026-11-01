@@ -33,12 +33,17 @@ import {
   type Trade,
 } from '../core';
 import type { Store } from './db';
-import { extractJson, type LlmProvider } from './llm';
+import { analystCatalog, analystsFromEnv, extractJson, usedModel, type AnalystMember, type LlmProvider } from './llm';
 import { timingSafeEqual } from 'node:crypto';
 import { getCandles, getQuote, POPULAR_SYMBOLS, providerStats, resolveSource, type CandleResponse, type Quote } from './candles';
 import { CURATED, findInstrument, loadCatalog, searchCatalog } from './catalog';
 import type { ReviewStatus } from './db';
 import { DISCOVERY } from '../core/discovery';
+import { buildPlans, type TradePlan } from '../core/plans';
+import { scanTriggers, type TriggerScan } from '../core/outlook';
+import { AI_DECISION_SCHEMA, ANALYST_SYSTEM, buildLevels, combinePanel, evidenceForPrompt, marketContextFrom, ruleBasedDecision, validateAiDecision, type AiDecision, type AnalystDecision, type AnalystInput, type FrameEvidence, type Level } from '../core/analyst';
+import type { CalendarEvent } from '../core/research';
+import { tfMinutes } from '../core/timeframe';
 import { checkBars, confluence, evaluateOutcome, evaluateStrategy, evidenceOf, levelIssues, rankStrategies, specForTemplate, specHash, type RankRow, type StrategySignal } from '../core/signals';
 import { DEFAULT_WATCHLIST, runResearch, topicCounts, type ResearchReport, type WatchItem } from './research';
 
@@ -188,7 +193,7 @@ function analyzeBacktest(trades: Trade[], initialCapital: number | null, q: Reco
   };
 }
 
-export function createApp(store: Store, llm: LlmProvider) {
+export function createApp(store: Store, llm: LlmProvider, analysts: AnalystMember[] = analystsFromEnv()) {
   const app = express();
   app.use(express.json({ limit: '15mb' }));
 
@@ -470,11 +475,12 @@ export function createApp(store: Store, llm: LlmProvider) {
     const symbol = String(q.symbol ?? ticker ?? 'XAUUSDT').slice(0, 40);
     let candles: CandleResponse;
     try {
-      candles = await getCandles({ symbol, tf, limit: Math.min(Number(q.limit ?? 1500), 3000), source: (source as never) ?? 'auto', ticker });
+      candles = await getCandles({ symbol, tf, limit: Math.min(Number(q.limit ?? 1500) || 1500, 5000), source: (source as never) ?? 'auto', ticker });
     } catch (e) {
       throw new HttpError(502, `Market data unavailable for ${ticker ?? symbol}: ${(e as Error).message}`);
     }
-    const { bars, check } = checkBars(candles.bars, candles.tf);
+    const live = q.live === true || q.live === 'true';
+    const { bars, check } = checkBars(candles.bars, candles.tf, Date.now(), { live });
     let quote: Quote | null = null;
     let quoteError: string | null = null;
     try {
@@ -524,7 +530,7 @@ export function createApp(store: Store, llm: LlmProvider) {
       change,
       crossCheck,
     };
-    return { market, bars, allBars: candles.bars, qtyStep: candles.qtyStep };
+    return { market, bars, allBars: candles.bars, qtyStep: candles.qtyStep, live };
   };
   app.get('/api/market/assets', (_req, res) => {
     res.json(CURATED);
@@ -558,7 +564,7 @@ export function createApp(store: Store, llm: LlmProvider) {
   app.post(
     '/api/signals',
     wrap(async (req) => {
-      rateLimit(req, 'signals', 40);
+      rateLimit(req, 'signals', 120);
       const ids: string[] = Array.isArray(req.body?.strategies) ? req.body.strategies.map(String).slice(0, 8) : [];
       if (!ids.length) throw new HttpError(400, 'Pick at least one strategy.');
       for (const id of ids) if (!TEMPLATES.some((t) => t.id === id)) throw new HttpError(400, `Unknown strategy "${id}"`);
@@ -577,6 +583,229 @@ export function createApp(store: Store, llm: LlmProvider) {
         return evaluateStrategy(spec, m.market.data.ok ? m.bars : [], m.market.tf, { qtyStep: m.qtyStep, templateId: id });
       });
       return { market: m.market, bars: m.allBars, signals, confluence: confluence(signals) };
+    }),
+  );
+  // Every strategy evaluated on one market/timeframe, cached per candle (shared by trade plans and the analyst).
+  const planCache = new Map<string, { plans: TradePlan[]; evaluated: number; signals: StrategySignal[] }>();
+  const evaluateAll = (m: Awaited<ReturnType<typeof loadMarket>>) => {
+    // In live mode the newest candle changes every few seconds, so the cache key follows its current close.
+    const lastBar = m.bars[m.bars.length - 1];
+    const key = [m.market.source, m.market.ticker, m.market.tf, m.market.data.lastClosedAt, m.live ? `live:${lastBar?.t}:${lastBar?.c}` : 'closed'].join('|');
+    let hit = planCache.get(key);
+    if (!hit) {
+      const signals = TEMPLATES.map((t) => evaluateStrategy(specForTemplate(t.id, m.market.tf, m.market.ticker), m.bars, m.market.tf, { qtyStep: m.qtyStep, templateId: t.id, withSeries: false }));
+      hit = { plans: buildPlans(signals), evaluated: signals.length, signals };
+      planCache.set(key, hit);
+      if (planCache.size > 50) planCache.delete(planCache.keys().next().value!);
+    }
+    return hit;
+  };
+  // Next-entry trigger search for one strategy, cached per candle (recomputed at most every 20 s while it forms).
+  const triggerCache = new Map<string, TriggerScan>();
+  const triggersFor = (m: Awaited<ReturnType<typeof loadMarket>>, id: string) => {
+    const raw = m.allBars;
+    const closed = m.live ? m.bars.slice(0, -1) : m.bars;
+    const forming = raw.length && raw[raw.length - 1].t > (closed[closed.length - 1]?.t ?? Infinity) ? raw[raw.length - 1] : null;
+    const spec = specForTemplate(id, m.market.tf, m.market.ticker);
+    // Higher-timeframe strategies need a longer history for their filters to warm up.
+    const needsLong = spec.components.some((c) => c.type === 'htf');
+    const key = [m.market.source, m.market.ticker, m.market.tf, id, closed[closed.length - 1]?.t, forming ? forming.t : 'none', Math.floor(Date.now() / 20000)].join('|');
+    let scan = triggerCache.get(key);
+    if (!scan) {
+      scan = scanTriggers(spec, closed, forming, m.market.tf, { qtyStep: m.qtyStep, barsUsed: needsLong ? 1000 : 600, steps: needsLong ? 11 : 15 });
+      triggerCache.set(key, scan);
+      if (triggerCache.size > 300) triggerCache.delete(triggerCache.keys().next().value!);
+    }
+    return { scan, forming };
+  };
+  app.post(
+    '/api/trade-plans',
+    wrap(async (req) => {
+      rateLimit(req, 'plans', 120);
+      const m = await loadMarket(req.body ?? {});
+      if (!m.market.data.ok) throw new HttpError(422, `No trade plans on invalid data: ${m.market.data.issues.join(' ')}`);
+      const { plans, evaluated } = evaluateAll(m);
+      return { market: m.market, plans, evaluated };
+    }),
+  );
+  // Multi-timeframe outlook: each strategy's current view and next entry triggers on 5m / 15m / 30m / 1H.
+  app.post(
+    '/api/outlook',
+    wrap(async (req) => {
+      rateLimit(req, 'outlook', 60);
+      const ids: string[] = Array.isArray(req.body?.strategies) ? req.body.strategies.map(String).slice(0, 6) : [];
+      if (!ids.length) throw new HttpError(400, 'Pick at least one strategy.');
+      for (const id of ids) if (!TEMPLATES.some((t) => t.id === id)) throw new HttpError(400, `Unknown strategy "${id}"`);
+      const tfs: string[] = (Array.isArray(req.body?.tfs) ? req.body.tfs.map(String) : ['5', '15', '30', '60']).filter((x: string) => ['1', '3', '5', '15', '30', '60', '120', '240'].includes(x)).slice(0, 4);
+      const frames = [];
+      for (const tf of tfs) {
+        let m: Awaited<ReturnType<typeof loadMarket>>;
+        try {
+          m = await loadMarket({ ...req.body, tf });
+        } catch (e) {
+          frames.push({ tf, error: (e as Error).message, strategies: [] });
+          continue;
+        }
+        if (!m.market.data.ok) {
+          frames.push({ tf, error: m.market.data.issues.join(' '), strategies: [] });
+          continue;
+        }
+        const raw = m.allBars;
+        const all = evaluateAll(m).signals;
+        // The candle that closes next: the forming one (when the source has it).
+        const closedBars = m.live ? m.bars.slice(0, -1) : m.bars;
+        const forming = raw.length && raw[raw.length - 1].t > (closedBars[closedBars.length - 1]?.t ?? Infinity) ? raw[raw.length - 1] : null;
+        const strategies = ids.map((id) => {
+          const sig = all.find((x) => x.strategyId === id)!;
+          const scan = triggersFor(m, id).scan;
+          return {
+            strategyId: id,
+            strategyName: sig.strategyName,
+            family: sig.family,
+            state: sig.state,
+            stage: sig.stage,
+            setupDir: sig.setupDir,
+            isNew: sig.isNew,
+            signalTime: sig.signalTime,
+            entry: sig.entry,
+            stop: sig.stop,
+            targets: sig.targets,
+            reason: sig.reason,
+            tfOk: sig.tfOk,
+            probability: sig.probability,
+            trades: sig.all.trades,
+            expectancyR: sig.all.expectancyR,
+            triggers: scan.triggers,
+            searched: scan.searched,
+          };
+        });
+        const last = raw[raw.length - 1];
+        frames.push({ tf, error: null, price: m.market.quote?.last ?? last?.c ?? null, formingOpen: forming?.o ?? null, formingCloseAt: forming ? new Date(forming.t + Number(tfMinutes(tf)) * 60000).toISOString() : null, live: m.live, data: m.market.data, strategies });
+      }
+      return { ticker: req.body?.ticker ?? req.body?.symbol, frames };
+    }),
+  );
+  /** Plain-language version of the AI provider errors a user can act on. */
+  const friendlyAiError = (msg: string, provider = '') => {
+    const envKey = analystCatalog().find((p) => provider.startsWith(p.id))?.envKey ?? (provider === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'GEMINI_API_KEY');
+    if (/credit balance is too low/i.test(msg)) return 'Your Anthropic account has no credit left. Add credit under Plans & Billing at platform.claude.com (or turn Claude off with AI_ANALYSTS_OFF=anthropic in .env).';
+    if (/RESOURCE_EXHAUSTED|quota|insufficient_quota|credits/i.test(msg)) return 'The free-tier limit for this key is used up for now. Wait a minute (or until tomorrow for a daily limit) and try again.';
+    if (/invalid x-api-key|authentication_error|API_KEY_INVALID|API key not valid|invalid api key|PERMISSION_DENIED|\b401\b|\b403\b/i.test(msg)) return `The key was rejected. Check ${envKey} in the .env file (no spaces) and restart the app.`;
+    if (/rate_limit|rate limit|\b429\b|\b413\b|too large|tokens per minute/i.test(msg)) return 'This free tier is rate-limiting right now (too many requests or tokens per minute). Wait a minute and try again.';
+    if (/overloaded|529|\b503\b|UNAVAILABLE|high demand/i.test(msg)) return 'The AI service is busy right now (free tiers get overloaded at times). Try again in a minute.';
+    if (/aborted due to timeout|TimeoutError/i.test(msg)) return 'The AI took too long to answer (free-tier models can be slow when busy). Try again in a minute.';
+    if (/ECONNREFUSED|fetch failed/i.test(msg) && provider === 'ollama') return 'Ollama is not running on this computer. Start the Ollama app, or remove OLLAMA_MODEL from .env.';
+    if (/No JSON object|Unexpected token|JSON/i.test(msg)) return 'The AI answered, but not in the required format, so its answer was not used.';
+    const m = /"message":"([^"]+)"/.exec(msg);
+    return m ? m[1] : msg;
+  };
+
+  // Economic calendar (Forex Factory weekly JSON), cached 30 minutes; failures just mean "no news data".
+  let calCache: { at: number; events: CalendarEvent[] } | null = null;
+  const calendarEvents = async (): Promise<CalendarEvent[]> => {
+    if (calCache && Date.now() - calCache.at < 30 * 60_000) return calCache.events;
+    try {
+      const res = await fetch('https://nfs.faireconomy.media/ff_calendar_thisweek.json', { signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const raw = (await res.json()) as { title: string; country: string; date: string; impact: string }[];
+      const events = raw.map((e) => ({ title: String(e.title), country: String(e.country), time: Date.parse(e.date), impact: String(e.impact) })).filter((e) => Number.isFinite(e.time));
+      calCache = { at: Date.now(), events };
+      return events;
+    } catch {
+      return calCache?.events ?? [];
+    }
+  };
+
+  // Trade analyst panel: the rule-based analyst plus every configured AI (Gemini ×2, Groq, Mistral, …) weigh the same
+  // evidence (all strategies on 5m–1H, next triggers, news, daily background). AIs may only pick price levels by id;
+  // each answer is validated, then the answers are combined by vote (see combinePanel).
+  const aiCache = new Map<string, { at: number; decision: AnalystDecision | null; problems: string[]; model: string | null }>();
+  type AnalystRun = { id: string; name: string; model: string | null; kind: 'rules' | 'ai'; status: 'ok' | 'cached' | 'rejected' | 'error' | 'duplicate'; decision: AnalystDecision | null; error: string | null; problems: string[]; ms: number };
+  const runAnalyst = async (m: AnalystMember, input: AnalystInput, levels: Level[], cacheKey: string): Promise<AnalystRun> => {
+    const t0 = Date.now();
+    const base = { id: m.id, name: m.name, kind: 'ai' as const };
+    const key = `${m.id}|${cacheKey}`;
+    const cached = aiCache.get(key);
+    if (cached && Date.now() - cached.at < 10 * 60_000) return { ...base, model: cached.model, status: 'cached', decision: cached.decision, error: null, problems: cached.problems, ms: 0 };
+    try {
+      const evidence = evidenceForPrompt(input, levels, { compact: m.compact });
+      const ai = await m.llm.completeJson<AiDecision>(ANALYST_SYSTEM, `Evidence (JSON):\n${JSON.stringify(evidence)}`, AI_DECISION_SCHEMA as unknown as Record<string, unknown>);
+      const v = validateAiDecision(ai, levels, input);
+      const model = usedModel(m.llm);
+      aiCache.set(key, { at: Date.now(), decision: v.decision, problems: v.problems, model });
+      if (aiCache.size > 300) aiCache.delete(aiCache.keys().next().value!);
+      return { ...base, model, status: v.decision ? 'ok' : 'rejected', decision: v.decision, error: null, problems: v.problems, ms: Date.now() - t0 };
+    } catch (e) {
+      return { ...base, model: usedModel(m.llm), status: 'error', decision: null, error: friendlyAiError((e as Error).message, m.id), problems: [], ms: Date.now() - t0 };
+    }
+  };
+  app.post(
+    '/api/analyst',
+    wrap(async (req) => {
+      rateLimit(req, 'analyst', 30);
+      const body = req.body ?? {};
+      const focusTf = ['5', '15', '30', '60'].includes(String(body.focusTf)) ? String(body.focusTf) : '15';
+      const ids: string[] = (Array.isArray(body.strategies) ? body.strategies.map(String) : []).filter((id: string) => TEMPLATES.some((t) => t.id === id)).slice(0, 6);
+      const frames: FrameEvidence[] = [];
+      let price: number | null = null;
+      let change: number | null = null;
+      for (const tf of ['5', '15', '30', '60']) {
+        try {
+          const m = await loadMarket({ ...body, tf });
+          price ??= m.market.quote?.last ?? m.allBars[m.allBars.length - 1]?.c ?? null;
+          change ??= m.market.change?.pct ?? null;
+          if (!m.market.data.ok) {
+            frames.push({ tf, dataStatus: 'invalid', signals: [], triggers: [] });
+            continue;
+          }
+          frames.push({
+            tf,
+            dataStatus: m.market.data.status,
+            signals: evaluateAll(m).signals,
+            triggers: ids.map((id) => ({ strategyId: id, strategyName: TEMPLATES.find((t) => t.id === id)!.name, triggers: triggersFor(m, id).scan.triggers })),
+          });
+        } catch {
+          frames.push({ tf, dataStatus: 'unavailable', signals: [], triggers: [] });
+        }
+      }
+      if (price === null || !frames.some((f) => f.signals.length)) throw new HttpError(502, 'Market data is unavailable, so no analysis can be made right now.');
+      const ticker = String(body.ticker ?? body.symbol ?? '');
+      // Daily background (asset trend, dollar, yields, headlines) from the latest research report; refresh it in the
+      // background when it is older than 6 hours so the next analysis has it.
+      const latest = store.listReports(1)[0]?.report as ResearchReport | undefined;
+      if (!latest || Date.now() - Date.parse(latest.createdAt) > 6 * 3600_000) research('quick').catch(() => {});
+      const input: AnalystInput = { ticker, price, change24hPct: change, focusTf, frames, events: await calendarEvents(), context: marketContextFrom(latest, ticker) };
+      const levels = buildLevels(input);
+      const rules = ruleBasedDecision(input);
+      const runs: AnalystRun[] = [{ id: 'rules', name: 'Rule-based analyst', model: null, kind: 'rules', status: 'ok', decision: rules, error: null, problems: [], ms: 0 }];
+      if (body.useAI !== false && analysts.length) {
+        // Same evidence (same candles on every timeframe) = same answer for 10 minutes, so a refresh does not pay twice.
+        const cacheKey = [ticker, focusTf, ids.join(','), body.live ? 'live' : 'closed', input.context?.asOf ?? '', ...frames.map((f) => `${f.tf}:${f.signals.map((x) => `${x.strategyId}${x.state}${x.signalTime ?? ''}`).join('')}`)].join('|');
+        const ai = await Promise.all(analysts.map((m) => runAnalyst(m, input, levels, cacheKey)));
+        // Two analysts that ended up on the same model (e.g. after a fallback) would be one opinion counted twice.
+        for (const r of ai) {
+          if (r.decision && ai.some((o) => o !== r && o.decision && o.model === r.model && ai.indexOf(o) < ai.indexOf(r))) {
+            r.status = 'duplicate';
+            r.decision = null;
+          }
+        }
+        runs.push(...ai);
+      }
+      const verdict = combinePanel(runs.map((r) => ({ id: r.id, name: r.name, model: r.model, decision: r.decision })), focusTf);
+      return {
+        engine: runs.length > 1 ? 'panel' : 'rules',
+        aiConfigured: analysts.length > 0,
+        decision: verdict.decision,
+        verdict: { action: verdict.action, votes: verdict.votes, counted: verdict.counted, agree: verdict.agree, summary: verdict.summary, chosenFrom: verdict.chosenFrom, waitFor: verdict.waitFor },
+        analysts: runs,
+        providers: analystCatalog(),
+        context: input.context ?? null,
+        price,
+        levelsConsidered: levels.length,
+        evidence: frames.map((f) => ({ tf: f.tf, dataStatus: f.dataStatus, buy: f.signals.filter((x) => x.state === 'BUY').length, sell: f.signals.filter((x) => x.state === 'SELL').length, strategies: f.signals.length })),
+        news: input.events.filter((e) => e.impact === 'High' && e.time >= Date.now() - 3600_000 && e.time <= Date.now() + 36 * 3600_000).slice(0, 6),
+        generatedAt: new Date().toISOString(),
+      };
     }),
   );
   app.post(
@@ -637,7 +866,8 @@ export function createApp(store: Store, llm: LlmProvider) {
       const mk = b.market as { symbol: string; source: string; ticker: string; instrument: string; tf: string } | undefined;
       if (!sig || !mk || (sig.state !== 'BUY' && sig.state !== 'SELL')) throw new HttpError(400, 'Only a BUY or SELL signal can be saved.');
       if (sig.entry == null || sig.stop == null || !sig.signalTime || !Array.isArray(sig.targets) || !sig.targets.length) throw new HttpError(400, 'Signal is missing entry, stop or targets.');
-      const issues = levelIssues(sig.state === 'BUY' ? 1 : -1, Number(sig.entry), Number(sig.stop), sig.targets.map(Number));
+      // A trailed stop may be beyond the entry; then only the targets' side is checked.
+      const issues = levelIssues(sig.state === 'BUY' ? 1 : -1, Number(sig.entry), sig.stopMoved ? Number(sig.entry) - (sig.state === 'BUY' ? 1 : -1) : Number(sig.stop), sig.targets.map(Number));
       if (issues.length) throw new HttpError(400, `Inconsistent levels: ${issues.join(' ')}`);
       const o = store.addOpportunity({
         symbol: String(mk.symbol),

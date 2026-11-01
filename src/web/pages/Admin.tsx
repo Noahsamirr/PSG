@@ -3,14 +3,16 @@
 import { useEffect, useState } from 'react';
 import { api, type AdminOverview, type Rankings, type ReviewStatus, type StrategyInfo } from '../api';
 import { ago, Badge, Card, Empty, fmt, Spinner, useApp } from '../components/ui';
+import { useI18n } from '../i18n';
 
 const STATUSES: ReviewStatus[] = ['experimental', 'awaiting_validation', 'approved', 'deprecated'];
 
 function Counts({ title, rows, label }: { title: string; rows: { key: string; count: number }[]; label?: (k: string) => string }) {
+  const { t } = useI18n();
   return (
-    <Card title={title}>
+    <Card title={t(title)}>
       {!rows.length ? (
-        <Empty>No activity recorded yet.</Empty>
+        <Empty>{t('No activity recorded yet.')}</Empty>
       ) : (
         <table className="table">
           <tbody>
@@ -31,6 +33,7 @@ function Counts({ title, rows, label }: { title: string; rows: { key: string; co
 
 export function Admin() {
   const { toast } = useApp();
+  const { t } = useI18n();
   const [token, setToken] = useState(() => {
     try {
       return sessionStorage.getItem('pf-admin-token') ?? '';
@@ -70,7 +73,7 @@ export function Admin() {
     if (token) load(token);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const nameOf = (id: string) => strategies.find((s) => s.id === id)?.name ?? id;
+  const nameOf = (id: string) => t(strategies.find((s) => s.id === id)?.name ?? id);
 
   const review = async (id: string, status: ReviewStatus) => {
     try {
@@ -86,17 +89,17 @@ export function Admin() {
     <div>
       <div className="page-head">
         <div>
-          <h1>Administrator</h1>
-          <p>Usage, script reliability, data-provider health and strategy review. Popularity and validated performance are shown separately; review decisions are logged and never change the measured results.</p>
+          <h1>{t('Administrator')}</h1>
+          <p>{t('Usage, script reliability, data-provider health and strategy review. Popularity and validated performance are shown separately; review decisions are logged and never change the measured results.')}</p>
         </div>
       </div>
       <div className="row mb" style={{ alignItems: 'flex-end' }}>
         <label className="field" style={{ width: 320 }}>
-          Admin token
-          <input type="password" value={token} onChange={(e) => setToken(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && load()} placeholder="Value of ADMIN_TOKEN on the server" autoComplete="off" />
+          {t('Admin token')}
+          <input type="password" value={token} onChange={(e) => setToken(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && load()} placeholder={t('Value of ADMIN_TOKEN on the server')} autoComplete="off" />
         </label>
         <button className="btn primary" onClick={() => load()} disabled={busy || !token}>
-          {busy ? <Spinner /> : 'Open'}
+          {busy ? <Spinner /> : t('Open')}
         </button>
       </div>
       {err && (
@@ -114,18 +117,18 @@ export function Admin() {
           </div>
 
           <div className="grid g2 mb">
-            <Card title="Data providers (since server start)">
+            <Card title={t('Data providers (since server start)')}>
               {!Object.keys(data.providers).length ? (
-                <Empty>No requests yet.</Empty>
+                <Empty>{t('No requests yet.')}</Empty>
               ) : (
                 <table className="table">
                   <thead>
                     <tr>
-                      <th>Provider</th>
-                      <th>OK</th>
-                      <th>Failed</th>
-                      <th>Success</th>
-                      <th>Last error</th>
+                      <th>{t('Provider')}</th>
+                      <th>{t('OK')}</th>
+                      <th>{t('Failed')}</th>
+                      <th>{t('Success')}</th>
+                      <th>{t('Last error')}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -144,7 +147,7 @@ export function Admin() {
                 </table>
               )}
             </Card>
-            <Card title="Scripts & integrations">
+            <Card title={t('Scripts & integrations')}>
               <div style={{ fontSize: 13, lineHeight: 1.7 }}>
                 <div>
                   Stored scripts: <b>{data.scripts.total}</b> · awaiting a recorded TradingView compile: <b>{data.scripts.awaitingCompile.length}</b> · with validation errors: <b>{data.scripts.withErrors.length}</b>
@@ -171,31 +174,31 @@ export function Admin() {
           </div>
 
           <Card
-            title="Strategy review"
+            title={t('Strategy review')}
             className="mb"
             actions={
               <div className="row">
                 <label className="row" style={{ fontSize: 12 }}>
-                  Min trades <input className="input-sm" style={{ width: 70 }} type="number" value={thr.minTrades} onChange={(e) => setThr({ ...thr, minTrades: Number(e.target.value) })} />
+                  {t('Min trades')} <input className="input-sm" style={{ width: 70 }} type="number" value={thr.minTrades} onChange={(e) => setThr({ ...thr, minTrades: Number(e.target.value) })} />
                 </label>
                 <label className="row" style={{ fontSize: 12 }}>
-                  Min out-of-sample <input className="input-sm" style={{ width: 70 }} type="number" value={thr.minOos} onChange={(e) => setThr({ ...thr, minOos: Number(e.target.value) })} />
+                  {t('Min out-of-sample')} <input className="input-sm" style={{ width: 70 }} type="number" value={thr.minOos} onChange={(e) => setThr({ ...thr, minOos: Number(e.target.value) })} />
                 </label>
                 <button
                   className="btn sm"
                   onClick={async () => {
                     try {
                       await api.adminRanking(token, thr.minTrades, thr.minOos);
-                      toast('Minimum evidence for rankings updated.', 'ok');
+                      toast(t('Minimum evidence for rankings updated.'), 'ok');
                     } catch (e) {
                       toast((e as Error).message, 'bad');
                     }
                   }}
                 >
-                  Save thresholds
+                  {t('Save thresholds')}
                 </button>
                 <button className="btn sm" onClick={() => api.rankings({ source: 'binancef', ticker: 'XAUUSDT', tf: '60' }).then(setRank).catch((e) => toast((e as Error).message, 'bad'))}>
-                  Load gold 1H evidence
+                  {t('Load gold 1H evidence')}
                 </button>
               </div>
             }
@@ -205,11 +208,11 @@ export function Admin() {
               <table className="table">
                 <thead>
                   <tr>
-                    <th>Strategy</th>
-                    <th>Status</th>
-                    {rank && <th>Gold 1H evidence (after costs)</th>}
-                    <th>Note (evidence for approval)</th>
-                    <th>Set status</th>
+                    <th>{t('Strategy')}</th>
+                    <th>{t('Status')}</th>
+                    {rank && <th>{t('Gold 1H evidence (after costs)')}</th>}
+                    <th>{t('Note (evidence for approval)')}</th>
+                    <th>{t('Set status')}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -219,13 +222,13 @@ export function Admin() {
                     return (
                       <tr key={s.id}>
                         <td>
-                          {s.name}
+                          {t(s.name)}
                           <div className="muted" style={{ fontSize: 12 }}>
-                            {s.category}
+                            {t(s.category)}
                           </div>
                         </td>
                         <td>
-                          <Badge tone={rv?.status === 'approved' ? 'good' : rv?.status === 'deprecated' ? 'bad' : rv?.status === 'awaiting_validation' ? 'warn' : 'neutral'}>{(rv?.status ?? 'experimental').replace('_', ' ')}</Badge>
+                          <Badge tone={rv?.status === 'approved' ? 'good' : rv?.status === 'deprecated' ? 'bad' : rv?.status === 'awaiting_validation' ? 'warn' : 'neutral'}>{t((rv?.status ?? 'experimental').replace('_', ' '))}</Badge>
                           {rv?.note && (
                             <div className="muted" style={{ fontSize: 12 }}>
                               {rv.note}
@@ -248,10 +251,10 @@ export function Admin() {
                         </td>
                         <td>
                           <select value="" onChange={(e) => e.target.value && review(s.id, e.target.value as ReviewStatus)} aria-label={`Set status for ${s.name}`}>
-                            <option value="">Change…</option>
+                            <option value="">{t('Change…')}</option>
                             {STATUSES.map((x) => (
                               <option key={x} value={x}>
-                                {x.replace('_', ' ')}
+                                {t(x.replace('_', ' '))}
                               </option>
                             ))}
                           </select>
@@ -264,9 +267,9 @@ export function Admin() {
             </div>
           </Card>
 
-          <Card title="Review log">
+          <Card title={t('Review log')}>
             {!data.reviewLog.length ? (
-              <Empty>No review decisions yet.</Empty>
+              <Empty>{t('No review decisions yet.')}</Empty>
             ) : (
               <ul className="checks">
                 {data.reviewLog.map((r, i) => (

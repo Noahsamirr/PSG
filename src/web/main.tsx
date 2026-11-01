@@ -7,16 +7,20 @@ import { Dashboard } from './pages/Dashboard';
 import { Analyze } from './pages/Analyze';
 import { Admin } from './pages/Admin';
 import { Discovery } from './pages/Discovery';
+import { Help } from './pages/Help';
 import { Builder } from './pages/Builder';
 import { Library } from './pages/Library';
 import { Workspace } from './pages/Workspace';
 import { Backtests } from './pages/Backtests';
 import { Research } from './pages/Research';
 import { SettingsPage } from './pages/Settings';
+import { I18nProvider, LangToggle, useI18n } from './i18n';
+import { ModeProvider, ModeSwitch, useMode } from './mode';
 
-const NAV = [
-  { path: '/', label: 'Market Dashboard', icon: 'home' },
+const NAV: { path?: string; label?: string; icon?: string; group?: string; simple?: boolean }[] = [
+  { path: '/', label: 'Market Dashboard', icon: 'home', simple: true },
   { path: '/discover', label: 'Strategy Discovery', icon: 'star' },
+  { path: '/help', label: 'Help & Support', icon: 'help', simple: true },
   { group: 'Advanced tools' },
   { path: '/overview', label: 'Scripts Overview', icon: 'layers' },
   { path: '/builder', label: 'Strategy Builder', icon: 'wand' },
@@ -29,7 +33,12 @@ const NAV = [
   { path: '/admin', label: 'Administrator', icon: 'layers' },
 ];
 
+// Screens whose inner content is not translated yet; in Arabic they show a short notice.
+const ENGLISH_ONLY = new Set(['builder', 'library', 'backtests', 'research', 'settings']);
+
 function App() {
+  const { t, lang } = useI18n();
+  const { mode } = useMode();
   const route = useRoute();
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -60,7 +69,7 @@ function App() {
           reloadSettings();
         })
         .catch((e) => {
-          if (!warned) toast(`Cannot reach the API: ${e.message} — retrying…`, 'bad');
+          if (!warned) toast(t('Cannot reach the API: {msg} — retrying…', { msg: e.message }), 'bad');
           warned = true;
           timer = setTimeout(loadCatalog, 3000);
         });
@@ -98,6 +107,9 @@ function App() {
     case 'settings':
       page = <SettingsPage />;
       break;
+    case 'help':
+      page = <Help />;
+      break;
     case 'discover':
       page = <Discovery />;
       break;
@@ -122,32 +134,37 @@ function App() {
               </svg>
             </span>
             Pine Forge
+            <LangToggle className="btn sm lang-toggle" />
           </div>
-          {NAV.map((n) =>
+          <ModeSwitch />
+          {NAV.filter((n) => mode === 'advanced' || n.simple).map((n) =>
             !n.path ? (
               <div key={n.group} className="nav-group">
-                {n.group}
+                {t(n.group!)}
               </div>
             ) : (
               <a key={n.path} href={`#${n.path}`} className={`nav-item ${active === n.path || (n.path === '/' && active === '/') ? 'active' : ''}`}>
-                <Icon name={n.icon} />
-                <span>{n.label}</span>
+                <Icon name={n.icon!} />
+                <span>{t(n.label!)}</span>
               </a>
             ),
           )}
           <div className="sidebar-foot">
             <label className="field">
-              Theme
+              {t('Theme')}
               <select value={theme} onChange={(e) => setTheme(e.target.value)}>
-                <option value="system">System</option>
-                <option value="light">Light</option>
-                <option value="dark">Dark</option>
+                <option value="system">{t('System')}</option>
+                <option value="light">{t('Light')}</option>
+                <option value="dark">{t('Dark')}</option>
               </select>
             </label>
-            <span>Pine Script v6 · educational tool. Not investment advice.</span>
+            <span>{t('Pine Script v6 · educational tool. Not investment advice.')}</span>
           </div>
         </nav>
-        <main className="main">{page}</main>
+        <main className="main">
+          {lang === 'ar' && ENGLISH_ONLY.has(top ?? '') && <div className="card card-pad mb muted">{t('This screen is available in English only for now.')}</div>}
+          {page}
+        </main>
       </div>
       {view}
     </AppCtx.Provider>
@@ -156,6 +173,10 @@ function App() {
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <I18nProvider>
+      <ModeProvider>
+        <App />
+      </ModeProvider>
+    </I18nProvider>
   </StrictMode>,
 );

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { api, type BacktestSummary, type ResearchReport, type ScriptRow, type VersionRow } from '../api';
 import { ago, Badge, Card, Empty, fmt, fmtPct, Icon, Spinner, useApp, validationTone } from '../components/ui';
 import { tfLabel } from '../../core/timeframe';
+import { useI18n } from '../i18n';
 
 export function Dashboard() {
   const { catalog, settings } = useApp();
@@ -23,87 +24,95 @@ export function Dashboard() {
   }, []);
   const favs = (scripts ?? []).filter((s) => s.favorite);
   const statuses = Object.values(latest).map((v) => validationTone(v.validation).tone);
+  const { t, tx, lang } = useI18n();
+  const ar = lang === 'ar';
   return (
     <div>
       <div className="page-head">
         <div>
-          <h1>Dashboard</h1>
-          <p>Generate Pine Script v6 indicators and strategies from researched templates, validate them, and launch them in TradingView. Transparent rules, realistic testing, explicit limitations — not a profit-prediction machine.</p>
+          <h1>{t('Scripts Overview')}</h1>
+          <p>{t('Generate Pine Script v6 indicators and strategies from researched templates, validate them, and launch them in TradingView. Transparent rules, realistic testing, explicit limitations — not a profit-prediction machine.')}</p>
         </div>
         <div className="hero-cta">
           <a className="btn" href="#/research">
-            <Icon name="globe" size={16} /> Market research
+            <Icon name="globe" size={16} /> {t('Market Research')}
           </a>
           <a className="btn primary" href="#/builder">
-            <Icon name="wand" size={16} /> New strategy
+            <Icon name="wand" size={16} /> {t('New strategy')}
           </a>
         </div>
       </div>
       <div className="grid g4" style={{ marginBottom: 16 }}>
         <div className="card stat">
-          <div className="label">Scripts</div>
+          <div className="label">{t('Scripts')}</div>
           <div className="value">{scripts?.length ?? '—'}</div>
-          <div className="sub">{favs.length} favourite{favs.length === 1 ? '' : 's'}</div>
+          <div className="sub">{t('{n} favourite(s)', { n: favs.length })}</div>
         </div>
         <div className="card stat">
-          <div className="label">Validation (recent scripts)</div>
+          <div className="label">{t('Validation (recent scripts)')}</div>
           <div className="value">
             {statuses.filter((s) => s === 'good').length}
-            <span className="muted" style={{ fontSize: 15 }}> / {statuses.length} clean</span>
+            <span className="muted" style={{ fontSize: 15 }}> / {t('{n} clean', { n: statuses.length })}</span>
           </div>
-          <div className="sub">{statuses.filter((s) => s === 'bad').length} with errors · {statuses.filter((s) => s === 'warn').length} with warnings</div>
+          <div className="sub">{t('{e} with errors · {w} with warnings', { e: statuses.filter((s) => s === 'bad').length, w: statuses.filter((s) => s === 'warn').length })}</div>
         </div>
         <div className="card stat">
-          <div className="label">Imported results</div>
+          <div className="label">{t('Imported results')}</div>
           <div className="value">{backtests.length}</div>
-          <div className="sub">{backtests.filter((b) => b.kind !== 'backtest').length} out-of-sample / paper / live</div>
+          <div className="sub">{t('{n} out-of-sample / paper / live', { n: backtests.filter((b) => b.kind !== 'backtest').length })}</div>
         </div>
         <div className="card stat">
-          <div className="label">Library</div>
+          <div className="label">{t('Library')}</div>
           <div className="value">{catalog?.templates.length ?? '—'}</div>
-          <div className="sub">
-            strategies · {catalog?.components.length ?? '—'} indicator modules · AI: {settings?.llm.configured ? settings.llm.model : 'off'}
-          </div>
+          <div className="sub">{t('strategies · {n} indicator modules · AI: {ai}', { n: catalog?.components.length ?? '—', ai: settings?.llm.configured ? (settings.llm.model ?? '') : t('off') })}</div>
         </div>
       </div>
       <div className="split">
         <div className="col">
-          <Card title="Recent scripts" actions={<a href="#/scripts" className="small">All scripts →</a>} pad={false}>
+          <Card title={t('Recent scripts')} actions={<a href="#/scripts" className="small">{t('All scripts →')}</a>} pad={false}>
             {scripts === null ? (
               <div className="empty">
                 <Spinner />
               </div>
             ) : scripts.length === 0 ? (
               <Empty>
-                No scripts yet. <a href="#/builder">Describe a strategy</a> or pick one from the <a href="#/library">library</a>.
+                {ar ? (
+                  <>
+                    لا توجد سكربتات بعد. <a href="#/builder">صف استراتيجية</a> أو اختر واحدة من <a href="#/library">المكتبة</a>.
+                  </>
+                ) : (
+                  <>
+                    No scripts yet. <a href="#/builder">Describe a strategy</a> or pick one from the <a href="#/library">library</a>.
+                  </>
+                )}
               </Empty>
             ) : (
               <table>
                 <thead>
                   <tr>
-                    <th>Name</th>
-                    <th>Type</th>
-                    <th>Chart</th>
-                    <th>Version</th>
-                    <th>Validation</th>
-                    <th>Updated</th>
+                    <th>{t('Name')}</th>
+                    <th>{t('Type')}</th>
+                    <th>{t('Chart')}</th>
+                    <th>{t('Version')}</th>
+                    <th>{t('Validation')}</th>
+                    <th>{t('Updated')}</th>
                   </tr>
                 </thead>
                 <tbody>
                   {scripts.slice(0, 8).map((s) => {
                     const v = latest[s.id];
-                    const t = v ? validationTone(v.validation) : null;
+                    const vt = v ? validationTone(v.validation) : null;
                     return (
                       <tr key={s.id} className="clickable" onClick={() => (location.hash = `/scripts/${s.id}`)}>
-                        <td>
+                        <td dir="auto">
                           {s.favorite && '★ '}
                           {s.name}
                         </td>
-                        <td>{s.output}</td>
+                        <td>{t(s.output)}</td>
                         <td>{v ? `${v.spec.market.symbol ? v.spec.market.symbol + ' ' : ''}${tfLabel(v.spec.market.timeframe)}` : '—'}</td>
                         <td>v{s.latestVersion}</td>
-                        <td>{t ? <Badge tone={t.tone} dot>{t.label}</Badge> : <Spinner />}</td>
-                        <td className="muted">{ago(s.updatedAt)}</td>
+                        <td>{vt ? <Badge tone={vt.tone} dot>{tx(vt.label)}</Badge> : <Spinner />}</td>
+                        <td className="muted">{tx(ago(s.updatedAt))}</td>
                       </tr>
                     );
                   })}
@@ -111,25 +120,25 @@ export function Dashboard() {
               </table>
             )}
           </Card>
-          <Card title="Recent backtest imports" actions={<a href="#/backtests" className="small">Analyse →</a>} pad={false}>
+          <Card title={t('Recent backtest imports')} actions={<a href="#/backtests" className="small">{t('Analyse →')}</a>} pad={false}>
             {backtests.length === 0 ? (
-              <Empty>Import a TradingView “List of trades” export to analyse robustness.</Empty>
+              <Empty>{t('Import a TradingView “List of trades” export to analyse robustness.')}</Empty>
             ) : (
               <table>
                 <thead>
                   <tr>
-                    <th>Run</th>
-                    <th>Type</th>
-                    <th className="num">Trades</th>
-                    <th className="num">Profit factor</th>
-                    <th className="num">Win rate</th>
-                    <th className="num">Net</th>
+                    <th>{t('Run')}</th>
+                    <th>{t('Type')}</th>
+                    <th className="num">{t('Trades')}</th>
+                    <th className="num">{t('Profit factor')}</th>
+                    <th className="num">{t('Win rate')}</th>
+                    <th className="num">{t('Net')}</th>
                   </tr>
                 </thead>
                 <tbody>
                   {backtests.slice(0, 6).map((b) => (
                     <tr key={b.id} className="clickable" onClick={() => (location.hash = `/backtests/${b.id}`)}>
-                      <td>{b.label}</td>
+                      <td dir="auto">{b.label}</td>
                       <td>
                         <Badge>{b.kind.replace('_', '-')}</Badge>
                       </td>
@@ -145,56 +154,91 @@ export function Dashboard() {
           </Card>
         </div>
         <div className="col">
-          <Card title="Market pulse" actions={<a href="#/research" className="small">Open research →</a>}>
+          <Card title={t('Market pulse')} actions={<a href="#/research" className="small">{t('Open research →')}</a>}>
             {!research ? (
               <Empty>
-                No research yet. <a href="#/research">Run market research</a> to pull the latest news, calendar and regimes.
+                {ar ? (
+                  <>
+                    لا توجد أبحاث بعد. <a href="#/research">شغّل أبحاث السوق</a> لجلب آخر الأخبار والأجندة وحالات السوق.
+                  </>
+                ) : (
+                  <>
+                    No research yet. <a href="#/research">Run market research</a> to pull the latest news, calendar and regimes.
+                  </>
+                )}
               </Empty>
             ) : (
               <div className="col">
-                <span className="muted small">Updated {ago(research.createdAt)}</span>
+                <span className="muted small">{t('Updated {when}', { when: tx(ago(research.createdAt)) })}</span>
                 {research.report.markets
                   .filter((m) => m.ok && m.regime)
                   .slice(0, 6)
                   .map((m) => (
                     <div key={m.symbol} className="row small">
                       <strong style={{ width: 70 }}>{m.symbol}</strong>
-                      <Badge tone={m.regime!.regime === 'Uptrend' ? 'good' : m.regime!.regime === 'Downtrend' ? 'bad' : 'neutral'}>{m.regime!.regime}</Badge>
+                      <Badge tone={m.regime!.regime === 'Uptrend' ? 'good' : m.regime!.regime === 'Downtrend' ? 'bad' : 'neutral'}>{t(m.regime!.regime)}</Badge>
                       <span className="muted num">1W {fmtPct(m.regime!.change.w1)}</span>
                     </div>
                   ))}
                 <div className="small">
-                  <strong>Top themes:</strong> {research.report.topics.slice(0, 4).map((t) => t.topic).join(', ')}
+                  <strong>{t('Top themes:')}</strong> <span dir="auto">{research.report.topics.slice(0, 4).map((x) => x.topic).join(', ')}</span>
                 </div>
                 {research.report.calendar && research.report.calendar.events.length > 0 && (
                   <div className="small">
-                    <strong>Next high-impact:</strong>{' '}
+                    <strong>{t('Next high-impact:')}</strong>{' '}
                     {research.report.calendar.events
                       .filter((e) => e.impact === 'High')
                       .slice(0, 2)
                       .map((e) => `${e.country} ${e.title} (${new Date(e.time).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })})`)
-                      .join(' · ') || 'none this week'}
+                      .join(' · ') || t('none this week')}
                   </div>
                 )}
               </div>
             )}
           </Card>
-          <Card title="Favourite strategies">
+          <Card title={t('Favourite strategies')}>
             {favs.length === 0 ? (
               <p className="muted small" style={{ margin: 0 }}>
-                Star a script in Scripts & Launcher to pin it here.
+                {t('Star a script in Scripts & Launcher to pin it here.')}
               </p>
             ) : (
               <ul className="clean">
                 {favs.map((s) => (
-                  <li key={s.id}>
+                  <li key={s.id} dir="auto">
                     <a href={`#/scripts/${s.id}`}>{s.name}</a>
                   </li>
                 ))}
               </ul>
             )}
           </Card>
-          <Card title="Workflow">
+          <Card title={t('Workflow')}>
+            {ar ? (
+              <ol className="steps small">
+                <li>
+                  <span>
+                    <a href="#/research">ابحث</a> في حالات السوق الحالية والمواضيع ومخاطر الأحداث.
+                  </span>
+                </li>
+                <li>
+                  <span>
+                    <a href="#/builder">صِف</a> استراتيجية، أو اختر <a href="#/library">قالبًا</a>، أو ابنِ توافقًا من عدة استراتيجيات.
+                  </span>
+                </li>
+                <li>
+                  <span>راجع المواصفات، ثم أنشئ السكربت وافحص تقرير التحقق.</span>
+                </li>
+                <li>
+                  <span>
+                    <a href="#/scripts">شغّله</a> في TradingView، وسجّل نتيجة التجميع، وشغّل Strategy Tester.
+                  </span>
+                </li>
+                <li>
+                  <span>
+                    <a href="#/backtests">استورد</a> الصفقات واختبرها تحت الضغط قبل أي تداول تجريبي أو حقيقي.
+                  </span>
+                </li>
+              </ol>
+            ) : (
             <ol className="steps small">
               <li>
                 <span>
@@ -220,6 +264,7 @@ export function Dashboard() {
                 </span>
               </li>
             </ol>
+            )}
           </Card>
         </div>
       </div>

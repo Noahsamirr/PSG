@@ -4,13 +4,14 @@ import { resolve } from 'node:path';
 import express from 'express';
 import { createApp } from './app';
 import { Store } from './db';
-import { createProvider } from './llm';
+import { analystsFromEnv, createProvider } from './llm';
 
 const port = Number(process.env.API_PORT ?? 8787);
 const host = process.env.HOST ?? '127.0.0.1';
 const store = new Store(process.env.DB_PATH ?? resolve('data/pine-forge.db'));
 const llm = createProvider();
-const { app, research } = createApp(store, llm);
+const analysts = analystsFromEnv();
+const { app, research } = createApp(store, llm, analysts);
 
 const dist = resolve('dist');
 if (process.env.NODE_ENV === 'production' && existsSync(dist)) {
@@ -30,4 +31,5 @@ setInterval(() => {
 app.listen(port, host, () => {
   const s = llm.status();
   console.log(`Pine Forge API on http://${host}:${port}  ·  LLM: ${s.provider}${s.model ? ` (${s.model})` : ''}`);
+  console.log(`Trade analyst panel: rule-based${analysts.map((a) => ` + ${a.name} (${a.llm.status().model})`).join('')}`);
 });

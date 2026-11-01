@@ -1,8 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { checkBars, confluence, evaluateOutcome, evaluateStrategy, evidenceOf, levelIssues, perf, rankStrategies, specForTemplate, specHash, tradeResults } from '../src/core/signals';
+import { checkBars, confluence, evaluateOutcome, evaluateStrategy, evidenceOf, levelIssues, perf, probabilityOf, rankStrategies, specForTemplate, specHash, tradeResults } from '../src/core/signals';
+import { scanTriggers } from '../src/core/outlook';
+import { runSimulation } from '../src/core/sim/engine';
 import { DISCOVERY } from '../src/core/discovery';
+import { buildPlans, chanceText, pickAnswer, WHY, type TradePlan } from '../src/core/plans';
+import type { StrategySignal } from '../src/core/signals';
 import { CURATED, searchCatalog } from '../src/server/catalog';
 import { TEMPLATES } from '../src/core/templates';
 import type { Bar } from '../src/core/sim/series';
@@ -271,5 +275,105 @@ describe('dashboard API (offline parts)', () => {
     expect(b.body.scriptId).toBe(a.body.scriptId);
     expect(a.body.validation.errorCount).toBe(0);
     expect(a.body.validation.compiled).toBe(false);
+  });
+});
+
+describe('trade plans', () => {
+  const sig = (id: string, family: string, state: 'BUY' | 'SELL' | 'NO TRADE', entry: number | null, stop: number | null) =>
+    ({ strategyId: id, strategyName: id, family, state, stage: state === 'NO TRADE' ? 'none' : 'confirmed', setupDir: 0, isNew: false, signalTime: '2026-10-26T03:00:00.000Z', entry, stop, targets: entry === null ? [] : [entry + (state === 'BUY' ? 30 : -30)], rewardRisk: 3, reasons: [{ label: 'x', role: 'trigger', met: true }] }) as unknown as StrategySignal;
+  it('has a plain-English reason for every strategy in both directions', () => {
+    for (const t of TEMPLATES) for (const d of [1, -1] as const) expect(WHY[t.id]?.(d).length).toBeGreaterThan(40);
+  });
+  it('classifies agree / same direction far away / disagree and counts independent families', () => {
+    const plans = buildPlans([
+      sig('a', 'structure', 'BUY', 4015, 4005), // risk 10
+      sig('b', 'trend', 'BUY', 4022, 4010), // 0.7 stop distances away → agrees
+      sig('c', 'structure', 'BUY', 4019, 4009), // agrees, same family as a
+      sig('d', 'trend', 'BUY', 4060, 4040), // 4.5 away → same direction, different entry
+      sig('e', 'momentum', 'SELL', 4030, 4050), // disagrees
+      sig('f', 'meanrev', 'NO TRADE', null, null),
+    ]);
+    expect(plans).toHaveLength(5);
+    const a = plans.find((p) => p.strategyId === 'a')!;
+    expect(a.agree.map((x) => x.strategyId)).toEqual(['b', 'c']);
+    expect(a.agree.find((x) => x.strategyId === 'c')!.related).toBe(true);
+    expect(a.independentAgree).toBe(1);
+    expect(a.sameDirection.map((x) => x.strategyId)).toEqual(['d']);
+    expect(a.disagree.map((x) => x.strategyId)).toEqual(['e']);
+    expect(a.entry).toBe(4015);
+    expect(a.stop).toBe(4005);
+  });
+});
+
+describe('probability of profit, live candles and next entry triggers', () => {
+  it('computes the share of profitable trades with a 95% Wilson range', () => {
+    const r = (x: number) => ({ r: x, holdBars: 1, ambiguous: false });
+    const p = probabilityOf([r(2), r(-1), r(-1), r(1.5), r(0.01)])!;
+    expect(p.n).toBe(5);
+    expect(p.p).toBeCloseTo(0.4); // break-even (0.01R) does not count as profit
+    expect(p.lo).toBeGreaterThan(0.1);
+    expect(p.hi).toBeLessThan(0.8);
+    expect(probabilityOf([])).toBeNull();
+    const big = probabilityOf(Array.from({ length: 400 }, (_, k) => r(k % 2 ? 1 : -1)))!;
+    expect(big.hi - big.lo).toBeLessThan(0.11); // more trades → narrower range
+  });
+  it('keeps the forming candle only in live mode', () => {
+    const bars = market(400);
+    const now = bars[bars.length - 1].t + 5 * 60000;
+    expect(checkBars(bars, '15', now).bars).toHaveLength(399);
+    const live = checkBars(bars, '15', now, { live: true });
+    expect(live.bars).toHaveLength(400);
+    expect(live.check.liveCandle).toBe(true);
+  });
+  it('finds the closing prices that trigger entries, and replaying the strategy confirms each edge', () => {
+    const bars = market(1500);
+    const f = bars[bars.length - 1];
+    let checked = 0;
+    for (const id of ['donchian_turtle', 'ema_trend', 'supertrend_trend', 'macd_trend', 'squeeze_breakout', 'bb_meanrev', 'donchian_retest', 'stoch_pullback']) {
+      const spec = specForTemplate(id, '15', 'XAUUSDT');
+      const scan = scanTriggers(spec, bars.slice(0, -1), f, '15', { steps: 15 });
+      expect(scan.searched.high).toBeGreaterThan(scan.searched.low);
+      const width = scan.searched.high - scan.searched.low;
+      const fires = (c: number, dir: 1 | -1) => {
+        const next = { ...f, h: Math.max(f.h, c), l: Math.min(f.l, c), c };
+        const res = runSimulation(spec, [...bars.slice(-601, -1), next], { chartTf: '15', showEvents: false });
+        return res.markers.some((m) => m.bar === 600 && m.dir === dir && ['entry', 'strong', 'blocked'].includes(m.kind));
+      };
+      for (const tr of scan.triggers) {
+        const dir = tr.action === 'BUY' ? 1 : -1;
+        // Each finite edge: just inside fires, a little outside does not.
+        if (tr.from !== null) {
+          expect(fires(tr.from + 0.005 * width, dir), `${id} ${tr.action} inside from ${tr.from}`).toBe(true);
+          expect(fires(tr.from - 0.05 * width, dir), `${id} ${tr.action} outside from ${tr.from}`).toBe(false);
+          checked++;
+        }
+        if (tr.to !== null) {
+          expect(fires(tr.to - 0.005 * width, dir), `${id} ${tr.action} inside to ${tr.to}`).toBe(true);
+          expect(fires(tr.to + 0.05 * width, dir), `${id} ${tr.action} outside to ${tr.to}`).toBe(false);
+          checked++;
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
+  });
+});
+
+describe('simple mode answer', () => {
+  const plan = (id: string, over: Partial<TradePlan>): TradePlan =>
+    ({ strategyId: id, strategyName: id, family: 'trend', action: 'BUY', isNew: false, tfOk: true, signalTime: '2026-10-26T03:00:00.000Z', entry: 100, stop: 95, targets: [110], rewardRisk: 2, probability: null, probabilityRecent: null, why: '', notMet: [], agree: [], sameDirection: [], disagree: [], developing: [], independentAgree: 0, summary: '', ...over }) as TradePlan;
+  it('prefers independent agreement, ignores strategies not designed for the timeframe, then fewer opponents', () => {
+    const peer = { strategyId: 'x', strategyName: 'x', family: 'momentum', action: 'BUY' as const, entry: 100, distanceR: 0.1, related: false, tfOk: true };
+    const a = plan('a', { independentAgree: 1, agree: [peer] });
+    const b = plan('b', { independentAgree: 0 });
+    const offDesign = plan('c', { independentAgree: 3, tfOk: false });
+    expect(pickAnswer([b, a, offDesign])?.strategyId).toBe('a');
+    const c = plan('c2', { disagree: [{ ...peer, action: 'SELL' }] });
+    expect(pickAnswer([c, b])?.strategyId).toBe('b');
+    expect(pickAnswer([offDesign])).toBeNull();
+  });
+  it('explains the chance of profit in words and flags small samples', () => {
+    expect(chanceText({ p: 0.33, lo: 0.1, hi: 0.7, n: 6 })).toEqual({ headline: '33%', detail: '2 of 6 past trades like this made money after costs.', rough: true });
+    expect(chanceText({ p: 0.5, lo: 0.4, hi: 0.6, n: 40 }).rough).toBe(false);
+    expect(chanceText(null).headline).toBe('Not measured yet');
   });
 });

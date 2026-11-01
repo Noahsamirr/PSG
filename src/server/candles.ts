@@ -245,7 +245,7 @@ function track(source: string, ok: boolean, err?: string) {
 }
 
 export async function getCandles(req: CandleRequest): Promise<CandleResponse> {
-  const limit = Math.min(Math.max(Number(req.limit) || 1000, 100), 3000);
+  const limit = Math.min(Math.max(Number(req.limit) || 1000, 100), 5000);
   const tf = (req.tf || '60').toUpperCase().replace(/^D$/, '1D').replace(/^W$/, '1W');
   if (tfMinutes(tf) === null) throw new Error(`Unknown timeframe "${req.tf}"`);
   let candidates: SourceCandidate[] = resolveSource(req.symbol, req.assetClass);
@@ -257,7 +257,9 @@ export async function getCandles(req: CandleRequest): Promise<CandleResponse> {
   else if (req.source && req.source !== 'auto') candidates = candidates.filter((c) => c.source === req.source);
   const key = JSON.stringify([candidates.map((c) => c.source + c.ticker), tf, limit]);
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < 60_000) return hit.res;
+  // Short timeframes need fresher data so the forming candle is current; 60 s is fine from 1H up.
+  const ttl = Math.min(60_000, Math.max(5_000, (tfMinutes(tf) ?? 60) * 2_000));
+  if (hit && Date.now() - hit.at < ttl) return hit.res;
   const errors: string[] = [];
   for (const c of candidates) {
     try {
